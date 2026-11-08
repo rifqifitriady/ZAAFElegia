@@ -704,6 +704,19 @@ mod tests {
     }
 
     #[test]
+    fn vars_only_pipeline_does_not_warn_about_unmapped_fields() {
+        let pipes = PipelineSet::new(vec![
+            parse_pipeline("name: v\nvars:\n  Admins: [root]\n").unwrap(),
+        ]);
+        assert!(!pipes.has_field_mappings());
+        let out = compile_src(
+            &rule_with("    s:\n        Image: a\n    condition: s\n"),
+            &pipes,
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[test]
     fn filters_fold_into_targeted_rules() {
         let src = format!(
             "{}---\ntitle: f\nlogsource:\n    product: windows\nfilter:\n    rules: [r1]\n    sel:\n        User|startswith: adm_\n    condition: sel\n---\ntitle: unused\nlogsource:\n    product: windows\nfilter:\n    rules: [other]\n    sel:\n        X: 1\n    condition: sel\n",

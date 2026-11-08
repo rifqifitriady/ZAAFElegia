@@ -38,10 +38,28 @@ pub struct Pipeline {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Transformation {
     FieldNameMapping {
+        #[serde(deserialize_with = "non_empty_mapping")]
         mapping: IndexMap<String, OneOrMany>,
         #[serde(default)]
         rule_conditions: Vec<LogSourceCondition>,
     },
+}
+
+/// Deserializes a field mapping, rejecting a field with an empty target list (it would
+/// otherwise map to no field at all). The error carries the YAML position.
+fn non_empty_mapping<'de, D>(d: D) -> Result<IndexMap<String, OneOrMany>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mapping = IndexMap::<String, OneOrMany>::deserialize(d)?;
+    for (field, targets) in &mapping {
+        if targets.targets().is_empty() {
+            return Err(serde::de::Error::custom(format!(
+                "mapping for `{field}` has an empty target list"
+            )));
+        }
+    }
+    Ok(mapping)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,6 +150,15 @@ impl PipelineSet {
 
     pub fn is_empty(&self) -> bool {
         self.pipelines.is_empty()
+    }
+
+    /// True when any loaded pipeline has a `field_name_mapping` transformation.
+    pub fn has_field_mappings(&self) -> bool {
+        self.pipelines.iter().any(|p| {
+            p.transformations
+                .iter()
+                .any(|t| matches!(t, Transformation::FieldNameMapping { .. }))
+        })
     }
 
     pub fn map_field(&self, ls: &LogSource, field: &str) -> MappedField {
@@ -271,6 +298,36 @@ mod tests {
             "{err:?}"
         );
         assert!(err.message.contains("drop_everything"), "{err}");
+    }
+
+    #[test]
+    fn empty_target_lists_are_rejected_with_a_position() {
+        let err = parse_pipeline(
+            "name: x\ntransformations:\n  - type: field_name_mapping\n    mapping:\n      F: []\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("`F`") && err.contains("empty"), "{err}");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("e.yml");
+        std::fs::write(
+            &p,
+            "name: x\ntransformations:\n  - type: field_name_mapping\n    mapping:\n      F: []\n",
+        )
+        .unwrap();
+        let err = PipelineSet::load(&[p]).unwrap_err();
+        assert!(
+            matches!(err.location, Location::At { line, .. } if line >= 3),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn has_field_mappings_ignores_vars_only_pipelines() {
+        let vars = parse_pipeline("name: v\nvars:\n  A: [x]\n").unwrap();
+        assert!(!PipelineSet::new(vec![vars.clone()]).has_field_mappings());
+        assert!(!PipelineSet::default().has_field_mappings());
+        let set = PipelineSet::new(vec![vars, parse_pipeline(ECS).unwrap()]);
+        assert!(set.has_field_mappings());
     }
 
     #[test]

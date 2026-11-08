@@ -111,7 +111,8 @@ pub enum Matcher {
     Cidr(ipnet::IpNet),
     /// Field present (any value, even null or empty) == the flag.
     Exists(bool),
-    /// True when every mapped alternative is absent or JSON null (mirrors `Exists(false)`).
+    /// True when every mapped alternative is absent or holds a JSON null; an alternative
+    /// whose array contains a null among other values counts as null (mirrors `Exists(false)`).
     Null,
     /// Compares the field with other field(s) of the same event.
     FieldRef {

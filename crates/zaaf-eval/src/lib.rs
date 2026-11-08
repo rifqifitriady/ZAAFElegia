@@ -59,8 +59,8 @@ fn eval_predicate(p: &Predicate, event: &dyn Event) -> bool {
         Target::Fields(fields) => match &p.matcher {
             Matcher::Exists(want) => fields.iter().any(|f| event.get(f).is_some()) == *want,
             // Mirrors `Exists(false)`: true only when EVERY mapped alternative is absent or
-            // contains a JSON null. A field that is present with a real value (even if
-            // another alternative is null) makes the predicate false.
+            // contains a JSON null (so `["a", null]` counts as null). A field that is
+            // present with no null (even `[]` or `{}`) makes the predicate false.
             Matcher::Null => fields.iter().all(|f| match event.get(f) {
                 None => true,
                 Some(values) => values.iter().any(|v| matches!(v, FieldValue::Null)),
@@ -96,8 +96,8 @@ fn value_matches(m: &Matcher, v: &FieldValue) -> bool {
         Matcher::Regex(re) => v.as_text().is_some_and(|t| re.is_match(&t)),
         Matcher::Num { op, value } => v.as_f64().is_some_and(|x| compare(*op, x, *value)),
         Matcher::Cidr(net) => v.as_text().and_then(|t| parse_ip(&t)).is_some_and(|ip| {
-            // IPv4-mapped IPv6 addresses count as the IPv4 address they wrap.
-            net.contains(&ip.to_canonical())
+            // IPv4-mapped IPv6 addresses match both as written and as the IPv4 they wrap.
+            net.contains(&ip) || net.contains(&ip.to_canonical())
         }),
         Matcher::TimePart { part, op, value } => timestamp_of(v)
             .is_some_and(|ts| compare(*op, time_part(ts, *part) as f64, *value as f64)),
@@ -105,10 +105,14 @@ fn value_matches(m: &Matcher, v: &FieldValue) -> bool {
     }
 }
 
-/// Trims, drops an IPv6 `%zone` suffix and parses. Leading-zero dotted quads stay rejected.
+/// Trims, drops an IPv6 `%zone` suffix (only when the text contains `:`) and parses. Leading-zero dotted quads stay rejected.
 fn parse_ip(text: &str) -> Option<IpAddr> {
     let t = text.trim();
-    let t = t.split_once('%').map_or(t, |(addr, _zone)| addr);
+    // A `%zone` suffix exists only on IPv6 text.
+    let t = match t.split_once('%') {
+        Some((addr, _zone)) if addr.contains(':') => addr,
+        _ => t,
+    };
     t.parse().ok()
 }
 
@@ -343,6 +347,12 @@ mod tests {
         assert!(hit("10.0.0.0/8", " 10.1.2.3 "));
         assert!(!hit("10.0.0.0/8", "8.8.8.8"));
         assert!(!hit("10.0.0.0/8", "010.1.2.3"));
+        // `%zone` is an IPv6 notion only.
+        assert!(!hit("10.0.0.0/8", "10.1.2.3%junk"));
+        // A mapped address matches a net that contains the mapped form itself.
+        assert!(hit("::ffff:0:0/96", "::ffff:10.1.2.3"));
+        assert!(hit("::/0", "::ffff:10.1.2.3"));
+        assert!(hit("::/0", "2001:db8::1"));
     }
 
     #[test]

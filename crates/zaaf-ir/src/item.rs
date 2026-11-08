@@ -105,7 +105,7 @@ pub(crate) fn compile_item(
         None => Target::AnyField,
         Some(field) => {
             let mapped = pipelines.map_field(logsource, field);
-            if !pipelines.is_empty() && !mapped.mapped {
+            if pipelines.has_field_mappings() && !mapped.mapped {
                 warnings.push(format!("field `{field}` is not mapped by any pipeline"));
             }
             Target::Fields(mapped.names)
