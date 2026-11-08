@@ -1,7 +1,14 @@
 //! Compiles whole documents: search identifiers, conditions, meta filters and metadata.
+//!
+//! Work is bounded by predicate budgets. A regex predicate weighs [`REGEX_WEIGHT`] units,
+//! every other predicate 1. One rule (or filter) may weigh at most [`MAX_RULE_PREDICATES`]
+//! units, and one `compile` call at most [`MAX_TOTAL_WEIGHT`] across all rules and filters;
+//! the first document that would cross it and every later one are skipped with a single
+//! error. A single item is capped at 16384 plain predicates. The SigmaHQ corpus (about
+//! 100k predicates) is far below these limits.
 
 use crate::ir::Expr;
-use crate::item::{and, compile_item, count_preds, or};
+use crate::item::{and, compile_item, or, weight};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use zaaf_pipeline::PipelineSet;
@@ -119,8 +126,12 @@ fn warning(source: &Option<PathBuf>, location: Location, msg: String) -> Diagnos
     located(Diagnostic::warning(location, msg), source)
 }
 
-/// Upper bound on predicates in one rule (or filter) after condition resolution.
-const MAX_RULE_PREDICATES: usize = 65_536;
+/// Weight of a regex predicate in the budgets (other predicates weigh 1).
+pub const REGEX_WEIGHT: usize = 16;
+/// Upper bound on the weight of one rule (or filter) after condition resolution.
+pub const MAX_RULE_PREDICATES: usize = 65_536;
+/// Upper bound on the summed weight of all rules and filters in one `compile` call.
+pub const MAX_TOTAL_WEIGHT: usize = 1_000_000;
 
 fn budget_error() -> String {
     format!("rule expands to more than {MAX_RULE_PREDICATES} predicates")
@@ -158,8 +169,17 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
     }
     out.filters = filters.len();
 
+    // Running weight over everything kept; once exceeded, the rest is skipped uncompiled.
+    let mut total = 0usize;
+    let mut skipped = 0usize;
+    let mut first_skip: Option<(Option<PathBuf>, Location)> = None;
+
     let mut compiled_filters = Vec::new();
     for (f, source) in filters {
+        if skipped > 0 {
+            skipped += 1;
+            continue;
+        }
         let mut warnings = Vec::new();
         match compile_detection(
             &f.detection,
@@ -168,16 +188,25 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             pipelines,
             &mut warnings,
         ) {
-            Ok(expr) => compiled_filters.push(CompiledFilter {
-                title: f.title.clone(),
-                preds: count_preds(&expr),
-                targets: f.rules.clone(),
-                expr,
-                source: source.clone(),
-                line: f.line,
-                col: f.col,
-                used: false,
-            }),
+            Ok(expr) if total + weight(&expr) > MAX_TOTAL_WEIGHT => {
+                skipped = 1;
+                first_skip = Some((source.clone(), document_at(f.line, f.col)));
+                drop(expr);
+            }
+            Ok(expr) => {
+                let preds = weight(&expr);
+                total += preds;
+                compiled_filters.push(CompiledFilter {
+                    title: f.title.clone(),
+                    preds,
+                    targets: f.rules.clone(),
+                    expr,
+                    source: source.clone(),
+                    line: f.line,
+                    col: f.col,
+                    used: false,
+                });
+            }
             Err(p) => out.diagnostics.push(error(
                 &source,
                 p.location,
@@ -195,6 +224,10 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
 
     let mut seen = HashSet::new();
     'rules: for (r, source) in rules {
+        if skipped > 0 {
+            skipped += 1;
+            continue;
+        }
         let mut warnings = Vec::new();
         let compiled = compile_detection(
             &r.detection,
@@ -241,7 +274,7 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             });
             if targeted {
                 f.used = true;
-                if count_preds(&expr) + f.preds > MAX_RULE_PREDICATES {
+                if weight(&expr) + f.preds > MAX_RULE_PREDICATES {
                     out.diagnostics.push(error(
                         &source,
                         document_at(r.line, r.col),
@@ -252,6 +285,13 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
                 expr = Expr::And(vec![expr, Expr::Not(Box::new(f.expr.clone()))]);
             }
         }
+        let rule_weight = weight(&expr);
+        if total + rule_weight > MAX_TOTAL_WEIGHT {
+            skipped = 1;
+            first_skip = Some((source.clone(), document_at(r.line, r.col)));
+            continue;
+        }
+        total += rule_weight;
         let level = match r.meta.level.as_deref() {
             None => Level::Medium,
             Some(s) => Level::parse(s).unwrap_or_else(|| {
@@ -280,6 +320,15 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             },
             expr,
         });
+    }
+    if let Some((source, location)) = first_skip {
+        out.diagnostics.push(error(
+            &source,
+            location,
+            format!(
+                "rule set exceeds the total compile budget of {MAX_TOTAL_WEIGHT} units; this and later rules were skipped ({skipped} documents skipped)"
+            ),
+        ));
     }
     for f in compiled_filters.iter().filter(|f| !f.used) {
         out.diagnostics.push(warning(
@@ -311,7 +360,7 @@ pub(crate) fn compile_detection(
                 let compiled = compile_item(item, logsource, pipelines, &mut item_warnings);
                 warnings.extend(item_warnings.into_iter().map(|w| Problem::item(item, w)));
                 let compiled = compiled.map_err(|e| Problem::item(item, e))?;
-                built += count_preds(&compiled);
+                built += weight(&compiled);
                 if built > MAX_RULE_PREDICATES {
                     return Err(Problem::item(item, budget_error()));
                 }
@@ -320,7 +369,7 @@ pub(crate) fn compile_detection(
             alternatives.push(and(items));
         }
         let expr = or(alternatives);
-        let cost = count_preds(&expr);
+        let cost = weight(&expr);
         ids.push((sid.name.clone(), expr, cost));
     }
     let mut used = 0usize;
@@ -714,7 +763,9 @@ mod tests {
     fn expansion_stops_at_the_item_cap() {
         let list = vec!["'%Big%'"; 2000].join(", ");
         let out = compile_src(
-            &rule_with(&format!("    s:\n        U|expand: [{list}]\n    condition: s\n")),
+            &rule_with(&format!(
+                "    s:\n        U|expand: [{list}]\n    condition: s\n"
+            )),
             &big_pipes(),
         );
         assert!(first_error(&out).contains("item expands to more than 16384 predicates"));
@@ -729,7 +780,11 @@ mod tests {
             )),
             &big_pipes(),
         );
-        assert!(first_error(&out).contains("comparison"), "{}", first_error(&out));
+        assert!(
+            first_error(&out).contains("comparison"),
+            "{}",
+            first_error(&out)
+        );
     }
 
     fn group_sizes(e: &Expr) -> Vec<usize> {
@@ -893,5 +948,49 @@ mod tests {
         );
         let out = compile_detection_src("    s:\n        Ip|cidr: '::1'\n    condition: s\n");
         assert!(matches!(&only_pred(&out).matcher, Matcher::Cidr(n) if n.to_string() == "::1/128"));
+    }
+
+    #[test]
+    fn total_budget_skips_the_rest_with_one_error() {
+        // Each rule weighs ~60k (under the rule budget); 20 of them exceed 1M.
+        let vals: Vec<String> = (0..3750).map(|i| format!("'v{i}'")).collect();
+        let one = |n: usize| {
+            format!(
+                "title: t{n}\nid: r{n}\nlogsource:\n    product: windows\ndetection:\n    s:\n        C|re: [{}]\n    condition: s\n",
+                vals.join(", ")
+            )
+        };
+        let src: Vec<String> = (0..20).map(one).collect();
+        let out = compile_src(&src.join("---\n"), &PipelineSet::default());
+        let errs: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].message.contains("total compile budget of 1000000"));
+        let kept = MAX_TOTAL_WEIGHT / (3750 * REGEX_WEIGHT);
+        assert_eq!(out.rules.len(), kept);
+        assert!(
+            errs[0]
+                .message
+                .contains(&format!("({} documents skipped)", 20 - kept))
+        );
+    }
+
+    #[test]
+    fn regex_predicates_are_weighted() {
+        let vals: Vec<String> = (0..5000).map(|i| format!("'v{i}'")).collect();
+        let out = compile_detection_src(&format!(
+            "    s:\n        C|re: [{}]\n    condition: s\n",
+            vals.join(", ")
+        ));
+        assert!(out.rules.is_empty());
+        assert!(first_error(&out).contains("rule expands to more than 65536 predicates"));
+    }
+
+    #[test]
+    fn normal_rule_sets_are_unaffected() {
+        let src: Vec<String> = (0..50).map(|n| format!(
+            "title: t{n}\nid: r{n}\nlogsource:\n    product: windows\ndetection:\n    s:\n        C|re: 'a{n}'\n    condition: s\n")).collect();
+        let out = compile_src(&src.join("---\n"), &PipelineSet::default());
+        assert_eq!(out.rules.len(), 50);
+        assert!(out.diagnostics.iter().all(|d| !d.is_error()));
     }
 }

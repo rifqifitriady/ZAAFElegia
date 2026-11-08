@@ -8,4 +8,7 @@ mod transform;
 
 pub use ir::{CmpOp, Expr, Matcher, Predicate, RefMode, Target, TimePart};
 pub use regex_engine::{BACKTRACK_LIMIT, CompiledRegex, RegexFlags};
-pub use rule::{CompileOutput, CompiledRule, Level, RuleInfo, SourcedDocument, compile};
+pub use rule::{
+    CompileOutput, CompiledRule, Level, MAX_RULE_PREDICATES, MAX_TOTAL_WEIGHT, REGEX_WEIGHT,
+    RuleInfo, SourcedDocument, compile,
+};

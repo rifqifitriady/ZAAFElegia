@@ -327,6 +327,7 @@ fn parse_net(s: &str) -> Result<ipnet::IpNet, String> {
 }
 
 /// Number of predicate leaves in an expression.
+#[cfg(test)]
 pub(crate) fn count_preds(e: &Expr) -> usize {
     match e {
         Expr::And(v) | Expr::Or(v) => v.iter().map(count_preds).sum(),
@@ -364,4 +365,16 @@ fn expand_values(
         out.push(group);
     }
     Ok(out)
+}
+
+/// Budget weight of an expression: regex predicates weigh `REGEX_WEIGHT`, all others 1.
+pub(crate) fn weight(e: &Expr) -> usize {
+    match e {
+        Expr::And(v) | Expr::Or(v) => v.iter().map(weight).sum(),
+        Expr::Not(e) => weight(e),
+        Expr::Pred(p) => match p.matcher {
+            Matcher::Regex(_) => crate::rule::REGEX_WEIGHT,
+            _ => 1,
+        },
+    }
 }
