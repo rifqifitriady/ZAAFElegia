@@ -33,10 +33,18 @@ fn evaluator() -> &'static Evaluator {
         let docs = parsed
             .documents
             .into_iter()
-            .map(|document| zaaf_ir::SourcedDocument { document, source: None })
+            .map(|document| zaaf_ir::SourcedDocument {
+                document,
+                source: None,
+            })
             .collect();
         let out = zaaf_ir::compile(docs, &zaaf_pipeline::PipelineSet::default());
-        assert_eq!(out.rules.len(), 1, "fuzz rule must compile: {:?}", out.diagnostics);
+        assert_eq!(
+            out.rules.len(),
+            1,
+            "fuzz rule must compile: {:?}",
+            out.diagnostics
+        );
         Evaluator::new(out.rules)
     })
 }

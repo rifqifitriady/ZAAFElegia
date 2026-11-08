@@ -39,6 +39,16 @@ pub fn read_json_events<R: BufRead + 'static>(reader: R) -> Box<dyn Iterator<Ite
     read_with_limits(reader, MAX_LINE_BYTES, MAX_ARRAY_BYTES)
 }
 
+/// Reader with caller-chosen caps, for fuzzing/tests; use [`read_json_events`].
+#[doc(hidden)]
+pub fn read_json_events_with_limits<R: BufRead + 'static>(
+    reader: R,
+    max_line_bytes: usize,
+    max_array_bytes: usize,
+) -> Box<dyn Iterator<Item = EventResult>> {
+    read_with_limits(reader, max_line_bytes, max_array_bytes)
+}
+
 fn read_with_limits<R: BufRead + 'static>(
     mut reader: R,
     max_line_bytes: usize,
@@ -261,6 +271,28 @@ mod tests {
         assert_eq!(e.message, "line exceeds 64 bytes");
         assert!(items[2].is_ok());
         assert_eq!(items[3].as_ref().unwrap_err().line, 4);
+    }
+
+    #[test]
+    fn public_limits_wrapper_enforces_both_caps() {
+        let mut long = b"{\"pad\": \"".to_vec();
+        long.extend(std::iter::repeat_n(b'x', 100));
+        long.extend_from_slice(b"\"}\n");
+        let items: Vec<_> =
+            read_json_events_with_limits(Cursor::new(long), 64, MAX_ARRAY_BYTES).collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap_err().message,
+            "line exceeds 64 bytes"
+        );
+
+        let mut arr = b"[".to_vec();
+        arr.extend(std::iter::repeat_n(b' ', 300));
+        arr.extend_from_slice(b"{\"a\": 1}]");
+        let items: Vec<_> =
+            read_json_events_with_limits(Cursor::new(arr), MAX_LINE_BYTES, 256).collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_err());
     }
 
     #[test]

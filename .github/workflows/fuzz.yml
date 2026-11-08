@@ -8,6 +8,7 @@ permissions:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -15,8 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Fuzz ${{ matrix.target }}
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then SECS=600; else SECS=30; fi
-          cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=$SECS
+          cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=$SECS -timeout=10
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
