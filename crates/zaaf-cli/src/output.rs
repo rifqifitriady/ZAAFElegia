@@ -126,7 +126,10 @@ impl<W: Write> Sink<W> {
                     )?;
                     self.wrote_header = true;
                 }
-                let cells: Vec<String> = row(&finding).iter().map(|c| csv_field(c)).collect();
+                let cells: Vec<String> = row(&finding)
+                    .iter()
+                    .map(|c| csv_field(&sanitize(c)))
+                    .collect();
                 writeln!(self.out, "{}", cells.join(","))
             }
         }
@@ -146,7 +149,7 @@ impl<W: Write> Sink<W> {
                     table.add_row(
                         [0, 1, 2, 3, 4, 6]
                             .iter()
-                            .map(|&i| sanitize_cell(&r[i]))
+                            .map(|&i| sanitize(&r[i]))
                             .collect::<Vec<_>>(),
                     );
                 }
@@ -184,9 +187,9 @@ fn row(f: &Value) -> [String; 7] {
     ]
 }
 
-/// Replaces control characters with visible `\xNN` escapes so table cells cannot
-/// inject terminal escape sequences.
-fn sanitize_cell(s: &str) -> String {
+/// Replaces control characters with visible `\xNN` escapes so rule-controlled text
+/// (table and CSV cells, warnings) cannot inject terminal escape sequences.
+pub fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_control() {
@@ -284,11 +287,27 @@ mod tests {
     }
 
     #[test]
-    fn table_cells_escape_control_chars() {
-        assert_eq!(
-            sanitize_cell("a\u{1b}[31m\rb\tc é"),
-            "a\\x1b[31m\\x0db\\x09c é"
+    fn csv_cells_escape_control_chars() {
+        let ev = JsonEvent::new(serde_json::json!({}));
+        let mut r = rule();
+        r.info.title = "T\u{1b}]0;x\u{7}".to_string();
+        let mut buf = Vec::new();
+        {
+            let mut sink = Sink::new(OutputFormat::Csv, &mut buf);
+            sink.write(detection_finding(&r, &ev, "s", 1)).unwrap();
+            sink.finish().unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}'),
+            "{text:?}"
         );
+        assert!(text.contains("T\\x1b]0;x\\x07"), "{text:?}");
+    }
+
+    #[test]
+    fn table_cells_escape_control_chars() {
+        assert_eq!(sanitize("a\u{1b}[31m\rb\tc é"), "a\\x1b[31m\\x0db\\x09c é");
     }
 
     #[test]

@@ -1,14 +1,14 @@
 //! `zaaf hunt`: run rules over log events.
 
 use crate::exit;
-use crate::output::{OutputFormat, Sink, detection_finding};
+use crate::output::{OutputFormat, Sink, detection_finding, sanitize};
 use crate::rules::load_rules;
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use zaaf_eval::Evaluator;
-use zaaf_event::{Event, parse_timestamp};
+use zaaf_event::Event;
 use zaaf_input::{EventResult, open_path, read_json_events};
 use zaaf_ir::{CompiledRule, Level};
 use zaaf_pipeline::PipelineSet;
@@ -85,9 +85,13 @@ struct Stats {
 fn bound(value: &Option<String>, flag: &str) -> Result<Option<DateTime<Utc>>, String> {
     match value {
         None => Ok(None),
-        Some(s) => parse_timestamp(s)
-            .map(Some)
-            .ok_or_else(|| format!("--{flag}: cannot parse `{s}` as a timestamp")),
+        Some(s) => DateTime::parse_from_rfc3339(s)
+            .map(|t| Some(t.with_timezone(&Utc)))
+            .map_err(|_| {
+                format!(
+                    "--{flag}: `{s}` is not an RFC 3339 timestamp (for example 2026-11-07T01:00:00Z)"
+                )
+            }),
     }
 }
 
@@ -99,15 +103,6 @@ fn keep(rule: &CompiledRule, min: Option<Level>, statuses: &[String]) -> bool {
                 .status
                 .as_deref()
                 .is_some_and(|s| statuses.iter().any(|w| w.eq_ignore_ascii_case(s))))
-}
-
-fn write_failed(e: io::Error) -> u8 {
-    if e.kind() == io::ErrorKind::BrokenPipe {
-        exit::OK
-    } else {
-        eprintln!("error: cannot write output: {e}");
-        exit::INTERNAL
-    }
 }
 
 pub fn run(args: HuntArgs) -> u8 {
@@ -129,7 +124,7 @@ pub fn run(args: HuntArgs) -> u8 {
     let rule_errors = loaded.diagnostics.iter().filter(|d| d.is_error()).count();
     for d in &loaded.diagnostics {
         if d.is_error() || args.verbose {
-            eprintln!("{d}");
+            eprintln!("{}", sanitize(&d.to_string()));
         }
     }
     if rule_errors > 0 && args.strict {
@@ -164,7 +159,8 @@ fn warn_regex_limits(evaluator: &Evaluator) {
         let info = &evaluator.rules()[idx].info;
         eprintln!(
             "warning: rule `{}` ({}): {hits} regex evaluation(s) hit the backtracking limit and were treated as no match",
-            info.title, info.id
+            sanitize(&info.title),
+            sanitize(&info.id)
         );
     }
 }
@@ -215,6 +211,11 @@ fn scan(
         for item in events {
             let event = match item {
                 Ok(ev) => ev,
+                Err(e) if e.fatal => {
+                    eprintln!("error: {name}: {}", e.message);
+                    stats.open_errors += 1;
+                    break;
+                }
                 Err(e) => {
                     stats.input_errors += 1;
                     if stats.input_errors <= 5 {
@@ -226,7 +227,7 @@ fn scan(
                             args.max_errors
                         );
                         if let Err(e) = sink.finish() {
-                            return write_failed(e);
+                            return exit::write_failed(e);
                         }
                         return exit::INPUT_ERRORS;
                     }
@@ -245,13 +246,13 @@ fn scan(
                 let finding =
                     detection_finding(&evaluator.rules()[idx], &event, &name, stats.matches);
                 if let Err(e) = sink.write(finding) {
-                    return write_failed(e);
+                    return exit::write_failed(e);
                 }
             }
         }
     }
     if let Err(e) = sink.finish() {
-        return write_failed(e);
+        return exit::write_failed(e);
     }
     let range_note = if stats.out_of_range > 0 {
         format!(" ({} outside time range)", stats.out_of_range)

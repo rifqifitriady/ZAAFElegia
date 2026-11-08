@@ -34,7 +34,7 @@ pub fn collect_rule_files(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<Diagnostic>) 
                     Ok(_) => {}
                     Err(e) => diags.push(
                         Diagnostic::error(Location::Unknown, format!("cannot read directory: {e}"))
-                            .with_file(p.clone()),
+                            .with_file(e.path().unwrap_or(p).to_path_buf()),
                     ),
                 }
             }
@@ -47,7 +47,7 @@ pub fn collect_rule_files(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<Diagnostic>) 
     // De-duplicate (first seen wins); canonicalize for comparison only.
     let mut seen = HashSet::new();
     files.retain(|f| seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())));
-    if files.is_empty() {
+    if files.is_empty() && diags.is_empty() {
         diags.push(Diagnostic::warning(
             Location::Unknown,
             "no rule files found",

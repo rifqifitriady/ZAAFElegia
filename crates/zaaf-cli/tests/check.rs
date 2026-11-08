@@ -88,7 +88,10 @@ fn missing_path_and_bad_pipeline() {
         .args(["check", "/nonexistent/rules"])
         .assert()
         .code(2)
-        .stdout(predicate::str::contains("path does not exist"));
+        .stdout(
+            predicate::str::contains("path does not exist")
+                .and(predicate::str::contains("no rule files found").not()),
+        );
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("good.yml"), GOOD).unwrap();
     fs::write(dir.path().join("p.yml"), "name: [").unwrap();
@@ -145,10 +148,34 @@ fn symlink_loop_is_an_error_not_a_hang() {
         .assert()
         .code(2)
         .stdout(predicate::str::contains("cannot read directory"));
+    let out = zaaf()
+        .args(["check", "--format", "json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let file = report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| {
+            d["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot read directory")
+        })
+        .unwrap()["file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        file.ends_with("loop"),
+        "diagnostic should name the failing entry: {file}"
+    );
 }
 
 #[test]
-fn walk_errors_and_extensions() {
+fn uppercase_and_mixed_case_yaml_extensions_are_loaded() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.YML"), GOOD).unwrap();
     fs::write(dir.path().join("b.Yaml"), GOOD.replace("r-whoami", "r-b")).unwrap();
@@ -217,4 +244,44 @@ fn quiet_keeps_errors() {
         .assert()
         .code(2)
         .stdout(predicate::str::contains("unknown modifier"));
+}
+
+#[test]
+fn check_with_closed_stdout_exits_zero() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("good.yml"), GOOD).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zaaf"))
+        .arg("check")
+        .arg(dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the read end at once, so the process's first write hits a broken pipe.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+}
+
+#[test]
+fn check_output_escapes_control_characters_in_titles() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("w.yml"),
+        "title: \"T \\e]0;pwned\\a\"\nid: r-w\nlogsource:\n    product: test\ndetection:\n    sel:\n        CommandLine|nope: x\n    condition: sel\n",
+    )
+    .unwrap();
+    let out = zaaf().arg("check").arg(dir.path()).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !text.contains('\u{1b}') && !text.contains('\u{7}'),
+        "{text:?}"
+    );
 }

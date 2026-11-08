@@ -296,3 +296,57 @@ fn strict_malformed_beats_fail_on_match() {
         .assert()
         .code(3);
 }
+
+#[test]
+fn directory_input_is_unreadable_and_exits_three() {
+    let dir = setup();
+    fs::create_dir(dir.path().join("logsdir")).unwrap();
+    hunt(dir.path())
+        .arg(dir.path().join("logsdir"))
+        .args(["-o", "ndjson"])
+        .assert()
+        .code(3)
+        .stderr(
+            predicate::str::contains("1 unreadable inputs")
+                .and(predicate::str::contains("0 malformed records")),
+        );
+}
+
+#[test]
+fn bare_number_time_bounds_are_usage_errors_mentioning_rfc3339() {
+    let dir = setup();
+    for flag in ["--from", "--to"] {
+        hunt(dir.path())
+            .args([flag, "2026"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("RFC 3339"));
+    }
+}
+
+#[test]
+fn csv_cells_and_regex_warning_escape_control_characters() {
+    let dir = only_rule(
+        "title: \"T \\e]0;pwned\\a\"\nid: r-esc\nstatus: test\nlevel: low\nlogsource:\n    product: test\ndetection:\n    sel:\n        CommandLine|re: '^(a|a)*\\1$'\n    condition: sel\n",
+    );
+    fs::write(
+        dir.path().join("e.ndjson"),
+        format!("{{\"CommandLine\": \"{}b\"}}\n", "a".repeat(40)),
+    )
+    .unwrap();
+    let out = zaaf()
+        .arg("hunt")
+        .arg("-r")
+        .arg(dir.path().join("rules"))
+        .args(["-o", "csv"])
+        .arg(dir.path().join("e.ndjson"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("hit the backtracking limit"), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}') && !stderr.contains('\u{7}'),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("\\x1b"), "{stderr:?}");
+}

@@ -26,12 +26,20 @@ pub struct InputError {
     /// 1-based line in the input (0 when unknown).
     pub line: usize,
     pub message: String,
+    /// True for I/O read errors: the input is unreadable and iteration ends.
+    /// False for malformed records (invalid JSON, oversized line or array),
+    /// which can be skipped.
+    pub fatal: bool,
 }
 
 pub type EventResult = Result<JsonEvent, InputError>;
 
-fn err_once(line: usize, message: String) -> Box<dyn Iterator<Item = EventResult>> {
-    Box::new(std::iter::once(Err(InputError { line, message })))
+fn err_once(line: usize, message: String, fatal: bool) -> Box<dyn Iterator<Item = EventResult>> {
+    Box::new(std::iter::once(Err(InputError {
+        line,
+        message,
+        fatal,
+    })))
 }
 
 /// Reads NDJSON (streaming) or a single top-level JSON array (buffered).
@@ -59,7 +67,7 @@ fn read_with_limits<R: BufRead + 'static>(
     let first = loop {
         let (consumed, found, newlines, is_bom) = match reader.fill_buf() {
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return err_once(0, format!("read error: {e}")),
+            Err(e) => return err_once(0, format!("read error: {e}"), true),
             Ok([]) => break None,
             Ok(buf) => {
                 if bom_seen < BOM.len() && buf[0] == BOM[bom_seen] {
@@ -97,7 +105,7 @@ fn read_with_limits<R: BufRead + 'static>(
             let mut data = Vec::new();
             let limit = u64::try_from(max_array_bytes).unwrap_or(u64::MAX - 1) + 1;
             if let Err(e) = reader.by_ref().take(limit).read_to_end(&mut data) {
-                return err_once(0, format!("read error: {e}"));
+                return err_once(0, format!("read error: {e}"), true);
             }
             if data.len() > max_array_bytes {
                 return err_once(
@@ -105,11 +113,16 @@ fn read_with_limits<R: BufRead + 'static>(
                     format!(
                         "JSON array input exceeds {max_array_bytes} bytes; use NDJSON for large inputs"
                     ),
+                    false,
                 );
             }
             match serde_json::from_slice::<Vec<Value>>(&data) {
                 Ok(items) => Box::new(items.into_iter().map(|v| Ok(JsonEvent::new(v)))),
-                Err(e) => err_once(skipped_lines + e.line(), format!("invalid JSON array: {e}")),
+                Err(e) => err_once(
+                    skipped_lines + e.line(),
+                    format!("invalid JSON array: {e}"),
+                    false,
+                ),
             }
         }
         Some(_) => Box::new(Lines {
@@ -152,6 +165,7 @@ impl<R: BufRead> Iterator for Lines<R> {
                         return Some(Err(InputError {
                             line: self.line_no + 1,
                             message: format!("read error: {e}"),
+                            fatal: true,
                         }));
                     }
                 };
@@ -184,6 +198,7 @@ impl<R: BufRead> Iterator for Lines<R> {
                 return Some(Err(InputError {
                     line: self.line_no,
                     message: format!("line exceeds {} bytes", self.max),
+                    fatal: false,
                 }));
             }
             if self.buf.last() == Some(&b'\r') {
@@ -198,6 +213,7 @@ impl<R: BufRead> Iterator for Lines<R> {
                     .map_err(|e| InputError {
                         line: self.line_no,
                         message: format!("invalid JSON: {e}"),
+                        fatal: false,
                     }),
             );
         }
@@ -206,6 +222,12 @@ impl<R: BufRead> Iterator for Lines<R> {
 
 pub fn open_path(path: &Path) -> std::io::Result<Box<dyn Iterator<Item = EventResult>>> {
     let file = File::open(path)?;
+    if file.metadata()?.is_dir() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "is a directory",
+        ));
+    }
     Ok(read_json_events(BufReader::new(file)))
 }
 
@@ -395,7 +417,9 @@ mod tests {
             pos: 0,
             panic_after: false,
         };
-        assert_eq!(read_json_events(trap).count(), 1);
+        let items: Vec<_> = read_json_events(trap).collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].as_ref().unwrap_err().fatal);
         let trap = Trap {
             data: b"{\"a\": 1}\n".to_vec(),
             pos: 0,
@@ -404,7 +428,28 @@ mod tests {
         let items: Vec<_> = read_json_events(trap).collect();
         assert_eq!(items.len(), 2);
         assert!(items[0].is_ok());
-        assert!(items[1].is_err());
+        assert!(items[1].as_ref().unwrap_err().fatal);
+    }
+
+    #[test]
+    fn malformed_records_are_not_fatal() {
+        let items = read("not json\n");
+        assert!(!items[0].as_ref().unwrap_err().fatal);
+        let items = read_lim(&[b'x'; 100], 64, MAX_ARRAY_BYTES);
+        assert!(!items[0].as_ref().unwrap_err().fatal);
+        let items = read("[ {\"a\": 1}, ");
+        assert!(!items[0].as_ref().unwrap_err().fatal);
+        let items = read_lim(b"[{\"a\": 1}, {\"a\": 2}]", 1024, 4);
+        assert!(!items[0].as_ref().unwrap_err().fatal);
+    }
+
+    #[test]
+    fn directory_is_an_open_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open_path(dir.path())
+            .err()
+            .expect("directory must not open");
+        assert!(e.to_string().contains("is a directory"), "{e}");
     }
 
     #[test]

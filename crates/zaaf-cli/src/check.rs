@@ -1,9 +1,11 @@
 //! `zaaf check`: parse, compile and lint rules.
 
 use crate::exit;
+use crate::output::sanitize;
 use crate::rules::load_rules;
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use zaaf_pipeline::PipelineSet;
 use zaaf_sigma::{Diagnostic, Location};
@@ -66,19 +68,22 @@ pub fn run(args: CheckArgs) -> u8 {
         .diagnostics
         .iter()
         .filter(|d| d.is_error() || !args.quiet);
-    match args.format {
-        DiagFormat::Text => {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let written = match args.format {
+        DiagFormat::Text => (|| {
             for d in shown {
-                println!("{d}");
+                writeln!(out, "{}", sanitize(&d.to_string()))?;
             }
-            println!(
+            writeln!(
+                out,
                 "checked {} files: {} rules, {} filters, {} correlations skipped, {errors} errors, {warnings} warnings",
                 loaded.files,
                 loaded.output.rules.len(),
                 loaded.output.filters,
                 loaded.output.correlations_skipped
-            );
-        }
+            )
+        })(),
         DiagFormat::Json => {
             let report = json!({
                 "files": loaded.files,
@@ -89,11 +94,15 @@ pub fn run(args: CheckArgs) -> u8 {
                 "warnings": warnings,
                 "diagnostics": shown.map(diagnostic_json).collect::<Vec<_>>(),
             });
-            println!(
+            writeln!(
+                out,
                 "{}",
                 serde_json::to_string_pretty(&report).expect("a JSON value always serializes")
-            );
+            )
         }
+    };
+    if let Err(e) = written.and_then(|()| out.flush()) {
+        return exit::write_failed(e);
     }
     if errors > 0 {
         exit::RULE_ERRORS
