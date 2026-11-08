@@ -1,6 +1,7 @@
 //! The intermediate representation shared by every evaluator.
 
 use crate::regex_engine::CompiledRegex;
+use std::collections::HashMap;
 use zaaf_sigma::SigmaString;
 
 /// A boolean expression over predicates. `And([])` is true, `Or([])` is false.
@@ -13,15 +14,23 @@ pub enum Expr {
 }
 
 impl Expr {
-    /// Total backtrack-limit hits over every regex in the expression.
+    /// Total backtrack-limit hits over every regex in the expression. Clones of one
+    /// regex share a counter, which is counted once.
     pub fn regex_limit_hits(&self) -> u64 {
+        let mut seen = HashMap::new();
+        self.collect_hits(&mut seen);
+        seen.values().sum()
+    }
+
+    fn collect_hits(&self, seen: &mut HashMap<usize, u64>) {
         match self {
-            Expr::And(v) | Expr::Or(v) => v.iter().map(Expr::regex_limit_hits).sum(),
-            Expr::Not(e) => e.regex_limit_hits(),
-            Expr::Pred(p) => match &p.matcher {
-                Matcher::Regex(re) => re.limit_hits(),
-                _ => 0,
-            },
+            Expr::And(v) | Expr::Or(v) => v.iter().for_each(|e| e.collect_hits(seen)),
+            Expr::Not(e) => e.collect_hits(seen),
+            Expr::Pred(p) => {
+                if let Matcher::Regex(re) = &p.matcher {
+                    seen.insert(re.counter_id(), re.limit_hits());
+                }
+            }
         }
     }
 }
@@ -125,5 +134,18 @@ mod tests {
         assert!(expected >= 2);
         let e = Expr::Or(vec![pred(a), Expr::Not(Box::new(pred(b)))]);
         assert_eq!(e.regex_limit_hits(), expected);
+    }
+
+    #[test]
+    fn cloned_regex_is_counted_once() {
+        let re =
+            CompiledRegex::with_backtrack_limit(r"^(a|a)*\1$", RegexFlags::default(), 10).unwrap();
+        let text = format!("{}b", "a".repeat(200));
+        assert!(!re.is_match(&text));
+        let per_counter = re.limit_hits();
+        assert!(per_counter >= 1);
+        assert_eq!(re.counter_id(), re.clone().counter_id());
+        let e = Expr::Or(vec![pred(re.clone()), pred(re)]);
+        assert_eq!(e.regex_limit_hits(), per_counter);
     }
 }

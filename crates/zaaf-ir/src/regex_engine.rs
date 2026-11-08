@@ -103,6 +103,11 @@ impl CompiledRegex {
         self.limit_hits.load(Ordering::Relaxed)
     }
 
+    /// Identity of the shared hit counter: clones report the same id.
+    pub fn counter_id(&self) -> usize {
+        Arc::as_ptr(&self.limit_hits) as usize
+    }
+
     pub fn needs_backtracking(&self) -> bool {
         matches!(self.engine, Engine::Backtracking(_))
     }

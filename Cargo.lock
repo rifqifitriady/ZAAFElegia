@@ -715,6 +715,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zaaf-eval"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "zaaf-event",
+ "zaaf-ir",
+ "zaaf-pipeline",
+ "zaaf-sigma",
+]
+
+[[package]]
 name = "zaaf-event"
 version = "0.0.1"
 dependencies = [
