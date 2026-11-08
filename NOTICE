@@ -18,3 +18,10 @@ MITRE ATT&CK and ATLAS
 ----------------------
 ATT&CK and ATLAS identifiers used in tags and coverage reports are
 © The MITRE Corporation, used under the ATT&CK and ATLAS terms of use.
+
+README artwork fonts
+--------------------
+The SVG files in assets/readme/ embed subsets of two typefaces, both licensed
+under the SIL Open Font License, Version 1.1 (texts in assets/readme/fonts/):
+- Big Shoulders Display, Copyright 2019 The Big Shoulders Project Authors.
+- IBM Plex Mono, Copyright 2017 IBM Corp. "Plex" is a Reserved Font Name.
