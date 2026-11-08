@@ -89,7 +89,7 @@ pub struct Sink<W: Write> {
     format: OutputFormat,
     out: W,
     buffered: Vec<Value>,
-    rows: Vec<[String; 5]>,
+    rows: Vec<[String; 7]>,
     wrote_header: bool,
 }
 
@@ -120,7 +120,10 @@ impl<W: Write> Sink<W> {
             }
             OutputFormat::Csv => {
                 if !self.wrote_header {
-                    writeln!(self.out, "time,level,rule_id,title,source")?;
+                    writeln!(
+                        self.out,
+                        "time,level,rule_id,title,author,references,source"
+                    )?;
                     self.wrote_header = true;
                 }
                 let cells: Vec<String> = row(&finding).iter().map(|c| csv_field(c)).collect();
@@ -137,9 +140,15 @@ impl<W: Write> Sink<W> {
             }
             OutputFormat::Table if !self.rows.is_empty() => {
                 let mut table = comfy_table::Table::new();
-                table.set_header(vec!["Time", "Level", "Rule", "Title", "Source"]);
+                table.set_header(vec!["Time", "Level", "Rule", "Title", "Author", "Source"]);
                 for r in &self.rows {
-                    table.add_row(r.iter().map(|c| sanitize_cell(c)).collect::<Vec<_>>());
+                    // References are too long for a table; use json/ndjson/csv for them.
+                    table.add_row(
+                        [0, 1, 2, 3, 4, 6]
+                            .iter()
+                            .map(|&i| sanitize_cell(&r[i]))
+                            .collect::<Vec<_>>(),
+                    );
                 }
                 writeln!(self.out, "{table}")?;
             }
@@ -149,7 +158,7 @@ impl<W: Write> Sink<W> {
     }
 }
 
-fn row(f: &Value) -> [String; 5] {
+fn row(f: &Value) -> [String; 7] {
     let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
     let time = f["time"]
         .as_i64()
@@ -161,6 +170,16 @@ fn row(f: &Value) -> [String; 5] {
         s(&f["unmapped"]["sigma"]["level"]),
         s(&f["finding_info"]["analytic"]["uid"]),
         s(&f["finding_info"]["title"]),
+        s(&f["unmapped"]["sigma"]["author"]),
+        f["unmapped"]["sigma"]["references"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_default(),
         s(&f["unmapped"]["source"]),
     ]
 }
@@ -245,9 +264,10 @@ mod tests {
         }
         let text = String::from_utf8(buf).unwrap();
         assert!(
-            text.starts_with("time,level,rule_id,title,source\n"),
+            text.starts_with("time,level,rule_id,title,author,references,source\n"),
             "{text}"
         );
+        assert!(text.contains(",Ann,https://x,s\n"), "{text}");
         assert!(text.contains("\"T, \"\"quoted\"\"\""), "{text}");
     }
 
@@ -269,6 +289,19 @@ mod tests {
             sanitize_cell("a\u{1b}[31m\rb\tc é"),
             "a\\x1b[31m\\x0db\\x09c é"
         );
+    }
+
+    #[test]
+    fn table_shows_author() {
+        let ev = JsonEvent::new(serde_json::json!({}));
+        let mut buf = Vec::new();
+        {
+            let mut sink = Sink::new(OutputFormat::Table, &mut buf);
+            sink.write(detection_finding(&rule(), &ev, "s", 1)).unwrap();
+            sink.finish().unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Author") && text.contains("Ann"), "{text}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ It does not convert them to another query language first.
 
 - **Conformance you can check.**
   - A public, language-neutral [conformance suite](conformance/README.md) for Sigma 2.1 (29 cases).
-  - A CI run that parses and compiles the whole SigmaHQ corpus (pinned to commit `53b90df`, see `scripts/sigmahq-corpus.sh`): SigmaHQ corpus: 3807/3807 files parse and compile (100.00%).
+  - A CI run that parses and compiles the whole SigmaHQ corpus (pinned to commit `53b90df`, see `scripts/sigmahq-corpus.sh`), with the bundled placeholder pipeline (`tests/sigmahq/placeholders.yml`): SigmaHQ corpus: 3807/3807 files parse and compile (100.00%). This measures parse and compile only, not detection accuracy.
 - **One rule, live and historical (planned, M4).** The same rule should give identical results on a stream and on Parquet.
 - **Detection for the AI era (planned, M5).** Logsources and rules for LLM gateways and MCP tool calls.
 - **Apache-2.0.** No copyleft dependencies, enforced by `cargo-deny`.
@@ -66,9 +66,14 @@ zaaf hunt -r rules/ -p ecs-windows.yml logs.ndjson
 ## Output
 
 Each match is an [OCSF](https://schema.ocsf.io/) Detection Finding (class 2004).
-The rule's `author` and `references` are always included under `unmapped.sigma`,
-as the Detection Rule License (DRL 1.1) requires for SigmaHQ rules.
-Other formats: `-o table|json|ndjson|csv`.
+That is the `json` and `ndjson` output (`-o json|ndjson`). The rule's `author` and
+`references` are always included under `unmapped.sigma`, as the Detection Rule License
+(DRL 1.1) requires for SigmaHQ rules.
+
+`-o csv` and `-o table` are summaries, not OCSF. CSV has the columns
+`time,level,rule_id,title,author,references,source` (references joined with ` | `).
+The table shows the author but not the references, which are too long for it; use
+`-o json`, `ndjson` or `csv` to see them.
 
 ## Exit codes
 
@@ -77,7 +82,7 @@ Other formats: `-o table|json|ndjson|csv`.
 | 0 | Success |
 | 1 | Matches found (only with `--fail-on-match`) |
 | 2 | Rule errors (with `--strict`), no rules left to run, or usage errors |
-| 3 | Input errors: an unreadable input file always; malformed records only with `--strict` or above `--max-errors` |
+| 3 | Input errors: an unreadable input file always; malformed records (including oversized lines) only with `--strict` or above `--max-errors` |
 | 4 | Internal error |
 
 When several conditions hold, the highest-precedence code wins (4 > 3 > 2 > 1 > 0).
@@ -86,7 +91,8 @@ A broken output pipe (for example `zaaf hunt ... | head`) exits 0.
 ## Input
 
 `zaaf hunt` reads NDJSON, a JSON array, or stdin. NDJSON lines over 8 MiB and JSON arrays
-over 256 MiB are reported as input errors. JSON arrays are buffered in memory in full, so
+over 256 MiB are reported as input errors. An oversized NDJSON line counts as a malformed
+record, so it exits 3 only with `--strict` or above `--max-errors`. JSON arrays are buffered in memory in full, so
 prefer NDJSON for large inputs.
 
 ## Limits
