@@ -5,7 +5,8 @@
 //!
 //! NDJSON is streamed line by line; each line is capped at [`MAX_LINE_BYTES`].
 //! JSON array input is **fully buffered** in memory before parsing and is
-//! capped at [`MAX_ARRAY_BYTES`]; use NDJSON for large inputs.
+//! capped at [`MAX_ARRAY_BYTES`]; an array that is invalid or over the cap fails as a whole
+//! with a fatal error (the input is unreadable); use NDJSON for large inputs.
 
 use serde_json::Value;
 use std::fs::File;
@@ -26,7 +27,7 @@ pub struct InputError {
     /// 1-based line in the input (0 when unknown).
     pub line: usize,
     pub message: String,
-    /// True for I/O read errors: the input is unreadable and iteration ends.
+    /// True for I/O read errors and whole-array failures: the input is unreadable and iteration ends.
     /// False for malformed records (invalid JSON, oversized line or array),
     /// which can be skipped.
     pub fatal: bool,
@@ -113,7 +114,7 @@ fn read_with_limits<R: BufRead + 'static>(
                     format!(
                         "JSON array input exceeds {max_array_bytes} bytes; use NDJSON for large inputs"
                     ),
-                    false,
+                    true,
                 );
             }
             match serde_json::from_slice::<Vec<Value>>(&data) {
@@ -121,7 +122,7 @@ fn read_with_limits<R: BufRead + 'static>(
                 Err(e) => err_once(
                     skipped_lines + e.line(),
                     format!("invalid JSON array: {e}"),
-                    false,
+                    true,
                 ),
             }
         }
@@ -437,10 +438,14 @@ mod tests {
         assert!(!items[0].as_ref().unwrap_err().fatal);
         let items = read_lim(&[b'x'; 100], 64, MAX_ARRAY_BYTES);
         assert!(!items[0].as_ref().unwrap_err().fatal);
+    }
+
+    #[test]
+    fn whole_array_failures_are_fatal() {
         let items = read("[ {\"a\": 1}, ");
-        assert!(!items[0].as_ref().unwrap_err().fatal);
+        assert!(items[0].as_ref().unwrap_err().fatal);
         let items = read_lim(b"[{\"a\": 1}, {\"a\": 2}]", 1024, 4);
-        assert!(!items[0].as_ref().unwrap_err().fatal);
+        assert!(items[0].as_ref().unwrap_err().fatal);
     }
 
     #[test]

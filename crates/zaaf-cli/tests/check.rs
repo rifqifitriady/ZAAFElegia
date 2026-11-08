@@ -285,3 +285,20 @@ fn check_output_escapes_control_characters_in_titles() {
         "{text:?}"
     );
 }
+
+#[test]
+fn check_with_closed_stdout_still_exits_two_on_rule_errors() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("bad.yml"), BAD).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zaaf"))
+        .arg("check")
+        .arg(dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}

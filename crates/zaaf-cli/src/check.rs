@@ -102,7 +102,13 @@ pub fn run(args: CheckArgs) -> u8 {
         }
     };
     if let Err(e) = written.and_then(|()| out.flush()) {
-        return exit::write_failed(e);
+        let code = exit::write_failed(e);
+        // A closed pipe must not hide rule errors (`zaaf check | head` under pipefail).
+        return if errors > 0 && code == exit::OK {
+            exit::RULE_ERRORS
+        } else {
+            code
+        };
     }
     if errors > 0 {
         exit::RULE_ERRORS

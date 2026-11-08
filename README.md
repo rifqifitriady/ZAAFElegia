@@ -114,7 +114,8 @@ To keep rules from exhausting memory or time, ZAAFElegia enforces these limits:
   tier a pattern fits decides its weight: up to 16 KiB is 16 units, 256 KiB is 256, 1 MiB is
   1,024 and 4 MiB is 4,096, so one unit is about 1 KiB. A pattern above 4 MiB is a rule error
   naming the limit. With the budgets above, compiled regexes use at most about 64 MiB per
-  rule and about 1 GiB per run.
+  rule and about 1 GiB per run. Match-time lazy-DFA caches can grow by up to the same
+  amount again, so the worst case is about 2 GiB.
 - Regular expressions use a linear-time engine. Patterns it cannot run fall back to a
   backtracking engine capped at 1,000,000 steps. Hitting that cap counts as no match, and
   `zaaf hunt` prints a warning naming the rule.

@@ -350,3 +350,18 @@ fn csv_cells_and_regex_warning_escape_control_characters() {
     );
     assert!(stderr.contains("\\x1b"), "{stderr:?}");
 }
+
+#[test]
+fn invalid_json_array_input_is_unreadable_and_exits_three() {
+    let dir = setup();
+    fs::write(
+        dir.path().join("arr.json"),
+        "[ {\"CommandLine\": \"whoami\"}, ",
+    )
+    .unwrap();
+    hunt(dir.path())
+        .arg(dir.path().join("arr.json"))
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("1 unreadable inputs"));
+}

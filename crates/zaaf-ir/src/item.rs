@@ -187,7 +187,7 @@ pub(crate) fn compile_item(
                 regex_weight += re.weight() as usize;
                 if regex_weight > crate::rule::MAX_RULE_PREDICATES {
                     return Err(format!(
-                        "rule expands to more than {} predicates",
+                        "rule exceeds the budget of {} weight units",
                         crate::rule::MAX_RULE_PREDICATES
                     ));
                 }

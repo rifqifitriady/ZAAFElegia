@@ -6,7 +6,8 @@
 //! units, and one `compile` call at most [`MAX_TOTAL_WEIGHT`] across all rules and filters;
 //! the first document that would cross it and every later one are skipped with a single
 //! error. A single item is capped at 16384 plain predicates. The SigmaHQ corpus (about
-//! 100k predicates) is far below these limits.
+//! 100k predicates) is far below these limits. Compiled regexes use about 1 GiB per run at
+//! most, plus up to the same again in match-time lazy-DFA caches.
 
 use crate::ir::Expr;
 use crate::item::{and, compile_item, or, weight};
@@ -133,7 +134,7 @@ pub const MAX_RULE_PREDICATES: usize = 65_536;
 pub const MAX_TOTAL_WEIGHT: usize = 1_000_000;
 
 fn budget_error() -> String {
-    format!("rule expands to more than {MAX_RULE_PREDICATES} predicates")
+    format!("rule exceeds the budget of {MAX_RULE_PREDICATES} weight units")
 }
 
 struct CompiledFilter {
@@ -804,7 +805,7 @@ mod tests {
         det.push_str("    condition: s0\n");
         let out = compile_src(&rule_with(&det), &big_pipes());
         assert!(out.rules.is_empty());
-        assert!(first_error(&out).contains("rule expands to more than 65536 predicates"));
+        assert!(first_error(&out).contains("rule exceeds the budget of 65536 weight units"));
     }
 
     #[test]
@@ -916,7 +917,7 @@ mod tests {
         let out = compile_detection_src(&det);
         assert!(out.rules.is_empty());
         assert!(
-            first_error(&out).contains("rule expands to more than 65536 predicates"),
+            first_error(&out).contains("rule exceeds the budget of 65536 weight units"),
             "{}",
             first_error(&out)
         );
@@ -947,7 +948,7 @@ mod tests {
         }
         let out = compile_src(&src, &PipelineSet::default());
         assert!(out.rules.is_empty());
-        assert!(first_error(&out).contains("rule expands to more than 65536 predicates"));
+        assert!(first_error(&out).contains("rule exceeds the budget of 65536 weight units"));
     }
 
     #[test]
@@ -1036,7 +1037,7 @@ mod tests {
         ));
         assert!(out.rules.is_empty());
         assert!(
-            first_error(&out).contains("more than 65536 predicates"),
+            first_error(&out).contains("budget of 65536 weight units"),
             "{}",
             first_error(&out)
         );
@@ -1051,7 +1052,7 @@ mod tests {
             vals.join(", ")
         ));
         assert!(out.rules.is_empty());
-        assert!(first_error(&out).contains("rule expands to more than 65536 predicates"));
+        assert!(first_error(&out).contains("rule exceeds the budget of 65536 weight units"));
     }
 
     #[test]
