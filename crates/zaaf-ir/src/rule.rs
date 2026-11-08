@@ -1,7 +1,7 @@
 //! Compiles whole documents: search identifiers, conditions, meta filters and metadata.
 
 use crate::ir::Expr;
-use crate::item::{and, compile_item, or};
+use crate::item::{and, compile_item, count_preds, or};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use zaaf_pipeline::PipelineSet;
@@ -119,8 +119,16 @@ fn warning(source: &Option<PathBuf>, location: Location, msg: String) -> Diagnos
     located(Diagnostic::warning(location, msg), source)
 }
 
+/// Upper bound on predicates in one rule (or filter) after condition resolution.
+const MAX_RULE_PREDICATES: usize = 65_536;
+
+fn budget_error() -> String {
+    format!("rule expands to more than {MAX_RULE_PREDICATES} predicates")
+}
+
 struct CompiledFilter {
     title: String,
+    preds: usize,
     targets: Vec<String>,
     expr: Expr,
     source: Option<PathBuf>,
@@ -162,6 +170,7 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
         ) {
             Ok(expr) => compiled_filters.push(CompiledFilter {
                 title: f.title.clone(),
+                preds: count_preds(&expr),
                 targets: f.rules.clone(),
                 expr,
                 source: source.clone(),
@@ -185,7 +194,7 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
     }
 
     let mut seen = HashSet::new();
-    for (r, source) in rules {
+    'rules: for (r, source) in rules {
         let mut warnings = Vec::new();
         let compiled = compile_detection(
             &r.detection,
@@ -232,6 +241,14 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             });
             if targeted {
                 f.used = true;
+                if count_preds(&expr) + f.preds > MAX_RULE_PREDICATES {
+                    out.diagnostics.push(error(
+                        &source,
+                        document_at(r.line, r.col),
+                        format!("rule `{}`: {}", r.meta.title, budget_error()),
+                    ));
+                    continue 'rules;
+                }
                 expr = Expr::And(vec![expr, Expr::Not(Box::new(f.expr.clone()))]);
             }
         }
@@ -282,7 +299,7 @@ pub(crate) fn compile_detection(
     pipelines: &PipelineSet,
     warnings: &mut Vec<Problem>,
 ) -> Result<Expr, Problem> {
-    let mut ids: Vec<(String, Expr)> = Vec::new();
+    let mut ids: Vec<(String, Expr, usize)> = Vec::new();
     for sid in &det.search_ids {
         let mut alternatives = Vec::new();
         for alt in &sid.alternatives {
@@ -295,12 +312,15 @@ pub(crate) fn compile_detection(
             }
             alternatives.push(and(items));
         }
-        ids.push((sid.name.clone(), or(alternatives)));
+        let expr = or(alternatives);
+        let cost = count_preds(&expr);
+        ids.push((sid.name.clone(), expr, cost));
     }
+    let mut used = 0usize;
     let conditions = det
         .conditions
         .iter()
-        .map(|c| resolve(c, &ids))
+        .map(|c| resolve(c, &ids, &mut used))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|message| Problem {
             location: Location::at(
@@ -313,38 +333,49 @@ pub(crate) fn compile_detection(
     Ok(or(conditions))
 }
 
-fn resolve(c: &CondExpr, ids: &[(String, Expr)]) -> Result<Expr, String> {
+fn resolve(c: &CondExpr, ids: &[(String, Expr, usize)], used: &mut usize) -> Result<Expr, String> {
     Ok(match c {
-        CondExpr::Ident(name) => ids
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, e)| e.clone())
-            .ok_or_else(|| format!("condition references unknown search identifier `{name}`"))?,
-        CondExpr::Not(inner) => Expr::Not(Box::new(resolve(inner, ids)?)),
+        CondExpr::Ident(name) => {
+            let (_, e, cost) = ids.iter().find(|(n, _, _)| n == name).ok_or_else(|| {
+                format!("condition references unknown search identifier `{name}`")
+            })?;
+            *used = used.saturating_add(*cost);
+            if *used > MAX_RULE_PREDICATES {
+                return Err(budget_error());
+            }
+            e.clone()
+        }
+        CondExpr::Not(inner) => Expr::Not(Box::new(resolve(inner, ids, used)?)),
         CondExpr::And(v) => and(v
             .iter()
-            .map(|x| resolve(x, ids))
+            .map(|x| resolve(x, ids, used))
             .collect::<Result<_, _>>()?),
         CondExpr::Or(v) => or(v
             .iter()
-            .map(|x| resolve(x, ids))
+            .map(|x| resolve(x, ids, used))
             .collect::<Result<_, _>>()?),
         CondExpr::Of(q, target) => {
-            let selected: Vec<Expr> = ids
+            let matching: Vec<&(String, Expr, usize)> = ids
                 .iter()
-                .filter(|(n, _)| match target {
+                .filter(|(n, _, _)| match target {
                     SelTarget::Them => !n.starts_with('_'),
                     SelTarget::Pattern(p) => SigmaString::parse(p).matches(n),
                 })
-                .map(|(_, e)| e.clone())
                 .collect();
-            if selected.is_empty() {
+            if matching.is_empty() {
                 let what = match target {
                     SelTarget::Them => "them".to_string(),
                     SelTarget::Pattern(p) => p.clone(),
                 };
                 return Err(format!("`{what}` matches no search identifier"));
             }
+            for (_, _, cost) in &matching {
+                *used = used.saturating_add(*cost);
+            }
+            if *used > MAX_RULE_PREDICATES {
+                return Err(budget_error());
+            }
+            let selected: Vec<Expr> = matching.into_iter().map(|(_, e, _)| e.clone()).collect();
             match q {
                 Quantifier::One => or(selected),
                 Quantifier::All => and(selected),
@@ -647,5 +678,178 @@ mod tests {
             &PipelineSet::default(),
         );
         assert_eq!(out.rules[0].info.id, "title:no id");
+    }
+
+    fn preds_in(e: &Expr) -> usize {
+        match e {
+            Expr::And(v) | Expr::Or(v) => v.iter().map(preds_in).sum(),
+            Expr::Not(e) => preds_in(e),
+            Expr::Pred(_) => 1,
+        }
+    }
+
+    fn group_sizes(e: &Expr) -> Vec<usize> {
+        let Expr::And(v) = e else {
+            panic!("expected And, got {e:?}")
+        };
+        v.iter()
+            .map(|g| match g {
+                Expr::Or(x) => {
+                    assert!(x.iter().all(|p| matches!(p, Expr::Pred(_))));
+                    x.len()
+                }
+                _ => panic!("expected Or group, got {g:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_ands_original_values_and_ors_variants() {
+        let out = compile_detection_src(
+            "    s:\n        C|windash|contains|all: ['-a', '-b']\n    condition: s\n",
+        );
+        assert_eq!(group_sizes(&out.rules[0].expr), vec![5, 5]);
+        let out = compile_detection_src(
+            "    s:\n        C|base64offset|contains|all: [ab, cd]\n    condition: s\n",
+        );
+        assert_eq!(group_sizes(&out.rules[0].expr), vec![3, 3]);
+    }
+
+    #[test]
+    fn expand_groups_per_original_value() {
+        let pipes = PipelineSet::new(vec![
+            parse_pipeline("name: v\nvars:\n  Admins: [a, b]\n").unwrap(),
+        ]);
+        let out = compile_src(
+            &rule_with("    s:\n        U|expand: '%Admins%'\n    condition: s\n"),
+            &pipes,
+        );
+        assert!(matches!(&out.rules[0].expr, Expr::Or(v) if v.len() == 2));
+        let out = compile_src(
+            &rule_with("    s:\n        U|all|expand: ['%Admins%', x]\n    condition: s\n"),
+            &pipes,
+        );
+        let Expr::And(v) = &out.rules[0].expr else {
+            panic!("{:?}", out.rules[0].expr)
+        };
+        assert_eq!(v.len(), 2);
+        assert!(matches!(&v[0], Expr::Or(x) if x.len() == 2));
+        assert!(matches!(&v[1], Expr::Pred(_)));
+    }
+
+    #[test]
+    fn item_predicate_budget() {
+        let vals: Vec<String> = (0..200).map(|i| format!("v{i}")).collect();
+        let pipes = PipelineSet::new(vec![
+            parse_pipeline(&format!("name: v\nvars:\n  Big: [{}]\n", vals.join(", "))).unwrap(),
+        ]);
+        let out = compile_src(
+            &rule_with(&format!(
+                "    s:\n        C|expand|windash|contains: [{}]\n    condition: s\n",
+                vec!["'%Big% -x'"; 17].join(", ")
+            )),
+            &pipes,
+        );
+        assert!(out.rules.is_empty());
+        assert!(
+            first_error(&out).contains("item expands to more than 16384 predicates"),
+            "{}",
+            first_error(&out)
+        );
+    }
+
+    #[test]
+    fn rule_predicate_budget_fails_fast() {
+        let vals: Vec<String> = (0..4000).map(|i| format!("v{i}")).collect();
+        let det = format!(
+            "    a:\n        C|contains: [{}]\n    condition: {}\n",
+            vals.join(", "),
+            vec!["a"; 20].join(" or ")
+        );
+        let t = std::time::Instant::now();
+        let out = compile_detection_src(&det);
+        assert!(out.rules.is_empty());
+        assert!(
+            first_error(&out).contains("rule expands to more than 65536 predicates"),
+            "{}",
+            first_error(&out)
+        );
+        assert!(t.elapsed().as_secs() < 5);
+        // within budget
+        let det = format!(
+            "    a:\n        C|contains: [{}]\n    condition: a\n",
+            vals.join(", ")
+        );
+        let out = compile_detection_src(&det);
+        assert_eq!(preds_in(&out.rules[0].expr), 4000);
+    }
+
+    #[test]
+    fn filter_fold_respects_rule_budget() {
+        let vals: Vec<String> = (0..4000).map(|i| format!("v{i}")).collect();
+        let big = |name: &str| {
+            format!(
+                "    {name}:\n        C|contains: [{}]\n    condition: {name}\n",
+                vals.join(", ")
+            )
+        };
+        let mut src = rule_with(&big("s"));
+        for i in 0..17 {
+            src.push_str(&format!(
+                "---\ntitle: f{i}\nlogsource:\n    product: windows\nfilter:\n    rules: [r1]\n{}",
+                big("sel")
+            ));
+        }
+        let out = compile_src(&src, &PipelineSet::default());
+        assert!(out.rules.is_empty());
+        assert!(first_error(&out).contains("rule expands to more than 65536 predicates"));
+    }
+
+    #[test]
+    fn dropped_modifiers_are_rejected() {
+        let cases = [
+            ("C|gt|lt: 5", "comparison"),
+            ("C|hour|day: 1", "time modifier"),
+            ("C|base64|cidr: 10.0.0.0/8", "base64"),
+            ("C|contains|re: a", "contains"),
+            ("C|windash|gt: 5", "windash"),
+            ("C|contains|hour: 5", "contains"),
+            ("C|exists|contains: true", "exists"),
+            ("C|exists|neq: true", "exists"),
+            ("C|fieldref|base64: X", "base64"),
+            ("C|fieldref|startswith|contains: X", "only one"),
+        ];
+        for (item, needle) in cases {
+            let out = compile_detection_src(&format!("    s:\n        {item}\n    condition: s\n"));
+            assert!(out.rules.is_empty(), "{item} should not compile");
+            let err = first_error(&out);
+            assert!(err.contains(needle), "{item}: `{needle}` not in `{err}`");
+        }
+    }
+
+    #[test]
+    fn valid_modifier_combos_still_compile() {
+        for item in [
+            "C|contains|windash: '-a'",
+            "C|wide|base64offset|contains: ab",
+            "C|base64|contains: ab",
+            "C|re|i: 'a.c'",
+            "C|hour|gte: 5",
+            "C|fieldref|contains: X",
+            "C|cased|contains: ab",
+        ] {
+            let out = compile_detection_src(&format!("    s:\n        {item}\n    condition: s\n"));
+            assert_eq!(out.rules.len(), 1, "{item}: {:?}", out.diagnostics);
+        }
+    }
+
+    #[test]
+    fn cidr_accepts_bare_addresses() {
+        let out = compile_detection_src("    s:\n        Ip|cidr: 10.1.2.3\n    condition: s\n");
+        assert!(
+            matches!(&only_pred(&out).matcher, Matcher::Cidr(n) if n.to_string() == "10.1.2.3/32")
+        );
+        let out = compile_detection_src("    s:\n        Ip|cidr: '::1'\n    condition: s\n");
+        assert!(matches!(&only_pred(&out).matcher, Matcher::Cidr(n) if n.to_string() == "::1/128"));
     }
 }

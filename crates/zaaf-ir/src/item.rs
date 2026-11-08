@@ -19,6 +19,19 @@ const STRING_TRANSFORMS: &[Modifier] = &[
     Modifier::Wide,
 ];
 
+/// Upper bound on predicates produced by one item.
+pub(crate) const MAX_ITEM_PREDICATES: usize = 16_384;
+
+const CMP_MODS: &[Modifier] = &[Modifier::Lt, Modifier::Lte, Modifier::Gt, Modifier::Gte];
+const TIME_MODS: &[Modifier] = &[
+    Modifier::Minute,
+    Modifier::Hour,
+    Modifier::Day,
+    Modifier::Week,
+    Modifier::Month,
+    Modifier::Year,
+];
+
 pub(crate) fn and(mut v: Vec<Expr>) -> Expr {
     if v.len() == 1 {
         v.remove(0)
@@ -105,120 +118,196 @@ pub(crate) fn compile_item(
         })
     };
     let case_sensitive = has(Cased);
-    let values = expand_values(&item.values, has(Expand), pipelines)?;
+    let groups = expand_values(&item.values, has(Expand), pipelines)?;
+    let flat: Vec<&RuleValue> = groups.iter().flatten().collect();
 
-    let preds: Vec<Expr> = if has(Exists) {
-        match values.as_slice() {
-            [RuleValue::Bool(b)] => vec![pred(Matcher::Exists(*b))],
+    let any_transform = mods.iter().any(|m| STRING_TRANSFORMS.contains(m));
+    let transform_names = || {
+        mods.iter()
+            .filter(|m| STRING_TRANSFORMS.contains(m))
+            .map(|m| m.name())
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    if has(Exists) && mods.len() > 1 {
+        return Err("`exists` cannot be combined with other modifiers".into());
+    }
+    if mods.iter().filter(|m| CMP_MODS.contains(m)).count() > 1 {
+        return Err("only one comparison modifier (`lt`, `lte`, `gt`, `gte`) is allowed".into());
+    }
+    if mods.iter().filter(|m| TIME_MODS.contains(m)).count() > 1 {
+        return Err("only one time modifier is allowed".into());
+    }
+    let typed_path = has(Re) || has(Cidr) || time_part.is_some() || cmp.is_some();
+    if typed_path && any_transform {
+        return Err(format!(
+            "string modifiers `{}` cannot be combined with `re`, `cidr`, numeric or time modifiers",
+            transform_names()
+        ));
+    }
+
+    let mut total = 0usize;
+    // One entry per original value; each holds that value's variants.
+    let mut out_groups: Vec<Vec<Expr>> = Vec::new();
+    let mut push_group = |g: Vec<Expr>, out: &mut Vec<Vec<Expr>>| -> Result<(), String> {
+        total += g.len();
+        if total > MAX_ITEM_PREDICATES {
+            return Err(format!(
+                "item expands to more than {MAX_ITEM_PREDICATES} predicates"
+            ));
+        }
+        out.push(g);
+        Ok(())
+    };
+
+    if has(Exists) {
+        match flat.as_slice() {
+            [RuleValue::Bool(b)] => out_groups.push(vec![pred(Matcher::Exists(*b))]),
             _ => return Err("`exists` takes a single boolean value".into()),
         }
-    } else if values.contains(&RuleValue::Null) {
-        if values.len() > 1 {
+    } else if flat.contains(&&RuleValue::Null) {
+        if flat.len() > 1 {
             return Err("`null` cannot be part of a list of values".into());
         }
         if mods.iter().any(|m| *m != Neq) {
             return Err("`null` cannot be combined with modifiers other than `neq`".into());
         }
-        vec![pred(Matcher::Null)]
+        out_groups.push(vec![pred(Matcher::Null)]);
     } else if has(Re) {
-        let mut out = Vec::new();
-        for v in &values {
-            let RuleValue::Str(src) = v else {
-                return Err("`re` needs string values".into());
-            };
-            let re = CompiledRegex::new(src, flags)?;
-            if re.needs_backtracking() {
-                warnings.push(format!(
-                    "regex `{src}` needs the backtracking engine (limit {BACKTRACK_LIMIT} steps)"
-                ));
-            }
-            out.push(pred(Matcher::Regex(re)));
-        }
-        out
-    } else if has(Cidr) {
-        values
-            .iter()
-            .map(|v| match v {
-                RuleValue::Str(s) => s
-                    .trim()
-                    .parse::<ipnet::IpNet>()
-                    .map(|n| pred(Matcher::Cidr(n)))
-                    .map_err(|e| format!("invalid CIDR `{s}`: {e}")),
-                _ => Err("`cidr` needs string values".to_string()),
-            })
-            .collect::<Result<_, _>>()?
-    } else if let Some(part) = time_part {
-        values
-            .iter()
-            .map(|v| match v {
-                RuleValue::Int(i) => Ok(pred(Matcher::TimePart {
-                    part,
-                    op: cmp.unwrap_or(CmpOp::Eq),
-                    value: *i,
-                })),
-                _ => Err("time modifiers need integer values".to_string()),
-            })
-            .collect::<Result<_, _>>()?
-    } else if let Some(op) = cmp {
-        values
-            .iter()
-            .map(|v| match v {
-                RuleValue::Int(i) => Ok(pred(Matcher::Num {
-                    op,
-                    value: *i as f64,
-                })),
-                RuleValue::Float(f) => Ok(pred(Matcher::Num { op, value: *f })),
-                _ => Err("numeric modifiers need numeric values".to_string()),
-            })
-            .collect::<Result<_, _>>()?
-    } else if has(FieldRef) {
-        let mode = if has(Contains) {
-            RefMode::Contains
-        } else if has(StartsWith) {
-            RefMode::StartsWith
-        } else if has(EndsWith) {
-            RefMode::EndsWith
-        } else {
-            RefMode::Equals
-        };
-        values
-            .iter()
-            .map(|v| match v {
-                RuleValue::Str(other) => Ok(pred(Matcher::FieldRef {
-                    other: pipelines.map_field(logsource, other).names,
-                    mode,
-                    case_sensitive,
-                })),
-                _ => Err("`fieldref` needs field names as values".to_string()),
-            })
-            .collect::<Result<_, _>>()?
-    } else {
-        let mut vals: Vec<Val> = values
-            .iter()
-            .map(|v| match v {
-                RuleValue::Str(s) => Val::S(SigmaString::parse(s)),
-                other => Val::S(SigmaString::literal(&other.to_text().unwrap_or_default())),
-            })
-            .collect();
-        for m in mods.iter().filter(|m| STRING_TRANSFORMS.contains(m)) {
-            vals = transform::apply(*m, vals)?;
-        }
-        vals.into_iter()
-            .map(|v| {
-                let mut s = v.into_sigma();
-                if item.field.is_none() {
-                    s.prepend_any_many();
-                    s.append_any_many();
+        for g in &groups {
+            let mut out = Vec::new();
+            for v in g {
+                let RuleValue::Str(src) = v else {
+                    return Err("`re` needs string values".into());
+                };
+                let re = CompiledRegex::new(src, flags)?;
+                if re.needs_backtracking() {
+                    warnings.push(format!(
+                        "regex `{src}` needs the backtracking engine (limit {BACKTRACK_LIMIT} steps)"
+                    ));
                 }
-                let pattern = if case_sensitive { s } else { s.to_lowercase() };
-                pred(Matcher::Str {
-                    pattern,
-                    case_sensitive,
+                out.push(pred(Matcher::Regex(re)));
+            }
+            push_group(out, &mut out_groups)?;
+        }
+    } else if has(Cidr) {
+        for g in &groups {
+            let out = g
+                .iter()
+                .map(|v| match v {
+                    RuleValue::Str(s) => parse_net(s.trim())
+                        .map(|n| pred(Matcher::Cidr(n)))
+                        .map_err(|e| format!("invalid CIDR `{s}`: {e}")),
+                    _ => Err("`cidr` needs string values".to_string()),
                 })
-            })
-            .collect()
+                .collect::<Result<Vec<_>, _>>()?;
+            push_group(out, &mut out_groups)?;
+        }
+    } else if let Some(part) = time_part {
+        for g in &groups {
+            let out = g
+                .iter()
+                .map(|v| match v {
+                    RuleValue::Int(i) => Ok(pred(Matcher::TimePart {
+                        part,
+                        op: cmp.unwrap_or(CmpOp::Eq),
+                        value: *i,
+                    })),
+                    _ => Err("time modifiers need integer values".to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            push_group(out, &mut out_groups)?;
+        }
+    } else if let Some(op) = cmp {
+        for g in &groups {
+            let out = g
+                .iter()
+                .map(|v| match v {
+                    RuleValue::Int(i) => Ok(pred(Matcher::Num {
+                        op,
+                        value: *i as f64,
+                    })),
+                    RuleValue::Float(f) => Ok(pred(Matcher::Num { op, value: *f })),
+                    _ => Err("numeric modifiers need numeric values".to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            push_group(out, &mut out_groups)?;
+        }
+    } else if has(FieldRef) {
+        let ref_mods: Vec<Modifier> = mods
+            .iter()
+            .copied()
+            .filter(|m| matches!(m, Contains | StartsWith | EndsWith))
+            .collect();
+        if ref_mods.len() > 1 {
+            return Err(
+                "`fieldref` accepts only one of `contains`, `startswith`, `endswith`".into(),
+            );
+        }
+        if mods
+            .iter()
+            .any(|m| STRING_TRANSFORMS.contains(m) && !ref_mods.contains(m))
+        {
+            return Err(format!(
+                "`fieldref` cannot be combined with string modifiers other than `contains`, `startswith` and `endswith` (found `{}`)",
+                transform_names()
+            ));
+        }
+        let mode = match ref_mods.first() {
+            Some(Contains) => RefMode::Contains,
+            Some(StartsWith) => RefMode::StartsWith,
+            Some(EndsWith) => RefMode::EndsWith,
+            _ => RefMode::Equals,
+        };
+        for g in &groups {
+            let out = g
+                .iter()
+                .map(|v| match v {
+                    RuleValue::Str(other) => Ok(pred(Matcher::FieldRef {
+                        other: pipelines.map_field(logsource, other).names,
+                        mode,
+                        case_sensitive,
+                    })),
+                    _ => Err("`fieldref` needs field names as values".to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            push_group(out, &mut out_groups)?;
+        }
+    } else {
+        for g in &groups {
+            let mut vals: Vec<Val> = g
+                .iter()
+                .map(|v| match v {
+                    RuleValue::Str(s) => Val::S(SigmaString::parse(s)),
+                    other => Val::S(SigmaString::literal(&other.to_text().unwrap_or_default())),
+                })
+                .collect();
+            for m in mods.iter().filter(|m| STRING_TRANSFORMS.contains(m)) {
+                vals = transform::apply(*m, vals)?;
+            }
+            let out = vals
+                .into_iter()
+                .map(|v| {
+                    let mut s = v.into_sigma();
+                    if item.field.is_none() {
+                        s.prepend_any_many();
+                        s.append_any_many();
+                    }
+                    let pattern = if case_sensitive { s } else { s.to_lowercase() };
+                    pred(Matcher::Str {
+                        pattern,
+                        case_sensitive,
+                    })
+                })
+                .collect();
+            push_group(out, &mut out_groups)?;
+        }
+    }
+    let combined = if has(All) {
+        and(out_groups.into_iter().map(or).collect())
+    } else {
+        or(out_groups.into_iter().flatten().collect())
     };
-    let combined = if has(All) { and(preds) } else { or(preds) };
     Ok(if has(Neq) {
         Expr::Not(Box::new(combined))
     } else {
@@ -226,25 +315,44 @@ pub(crate) fn compile_item(
     })
 }
 
+fn parse_net(s: &str) -> Result<ipnet::IpNet, String> {
+    match s.parse::<ipnet::IpNet>() {
+        Ok(n) => Ok(n),
+        Err(e) => s
+            .parse::<std::net::IpAddr>()
+            .map(ipnet::IpNet::from)
+            .map_err(|_| e.to_string()),
+    }
+}
+
+/// Number of predicate leaves in an expression.
+pub(crate) fn count_preds(e: &Expr) -> usize {
+    match e {
+        Expr::And(v) | Expr::Or(v) => v.iter().map(count_preds).sum(),
+        Expr::Not(e) => count_preds(e),
+        Expr::Pred(_) => 1,
+    }
+}
+
+/// Values grouped per original value; each group holds that value's expansions.
 fn expand_values(
     values: &[RuleValue],
     expand: bool,
     pipelines: &PipelineSet,
-) -> Result<Vec<RuleValue>, String> {
+) -> Result<Vec<Vec<RuleValue>>, String> {
     if !expand {
-        return Ok(values.to_vec());
+        return Ok(values.iter().map(|v| vec![v.clone()]).collect());
     }
     let lookup = |name: &str| pipelines.placeholder(name).map(<[String]>::to_vec);
     let mut out = Vec::new();
     for v in values {
-        match v {
-            RuleValue::Str(s) => out.extend(
-                transform::expand_raw(s, &lookup)?
-                    .into_iter()
-                    .map(RuleValue::Str),
-            ),
-            other => out.push(other.clone()),
-        }
+        out.push(match v {
+            RuleValue::Str(s) => transform::expand_raw(s, &lookup)?
+                .into_iter()
+                .map(RuleValue::Str)
+                .collect(),
+            other => vec![other.clone()],
+        });
     }
     Ok(out)
 }
