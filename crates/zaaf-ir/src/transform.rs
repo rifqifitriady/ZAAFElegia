@@ -1,5 +1,3 @@
-#![allow(dead_code)] // used by the compiler added in Task 7
-
 //! Value transformation modifiers (Sigma modifiers appendix).
 
 use base64::Engine as _;
