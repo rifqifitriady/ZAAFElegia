@@ -1,12 +1,12 @@
 //! Sigma rule parser for ZAAFElegia.
 
+pub mod diagnostic;
+pub mod modifier;
+pub mod value;
+
+pub use diagnostic::{Diagnostic, Location, Severity};
+pub use modifier::{FieldKey, Modifier, parse_field_key};
+pub use value::RuleValue;
+
 /// Version of the Sigma specification this crate implements.
 pub const SPEC_VERSION: &str = "2.1.0";
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn spec_version_is_2_1() {
-        assert_eq!(super::SPEC_VERSION, "2.1.0");
-    }
-}
