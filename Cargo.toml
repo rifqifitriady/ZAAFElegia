@@ -37,5 +37,6 @@ zaaf-input = { path = "crates/zaaf-input", version = "0.0.1" }
 zaaf-testkit = { path = "crates/zaaf-testkit", version = "0.0.1" }
 
 [profile.release]
+# panic must stay "unwind": zaaf maps panics to exit code 4 via catch_unwind.
 lto = "thin"
 codegen-units = 1

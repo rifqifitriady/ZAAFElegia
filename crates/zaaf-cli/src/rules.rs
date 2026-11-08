@@ -1,5 +1,6 @@
 //! Locating, parsing and compiling rule files.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use zaaf_ir::{CompileOutput, SourcedDocument, compile};
@@ -13,7 +14,9 @@ pub struct LoadedRules {
 }
 
 fn is_yaml(p: &Path) -> bool {
-    matches!(p.extension().and_then(|e| e.to_str()), Some("yml" | "yaml"))
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml"))
 }
 
 pub fn collect_rule_files(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<Diagnostic>) {
@@ -23,7 +26,7 @@ pub fn collect_rule_files(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<Diagnostic>) 
         if p.is_file() {
             files.push(p.clone());
         } else if p.is_dir() {
-            for entry in WalkDir::new(p).sort_by_file_name() {
+            for entry in WalkDir::new(p).follow_links(true).sort_by_file_name() {
                 match entry {
                     Ok(e) if e.file_type().is_file() && is_yaml(e.path()) => {
                         files.push(e.into_path())
@@ -40,6 +43,15 @@ pub fn collect_rule_files(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<Diagnostic>) 
                 Diagnostic::error(Location::Unknown, "path does not exist").with_file(p.clone()),
             );
         }
+    }
+    // De-duplicate (first seen wins); canonicalize for comparison only.
+    let mut seen = HashSet::new();
+    files.retain(|f| seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())));
+    if files.is_empty() {
+        diags.push(Diagnostic::warning(
+            Location::Unknown,
+            "no rule files found",
+        ));
     }
     (files, diags)
 }

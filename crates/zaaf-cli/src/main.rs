@@ -27,8 +27,15 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let code = catch_unwind(AssertUnwindSafe(|| match cli.command {
-        Command::Check(args) => check::run(args),
+    let code = catch_unwind(AssertUnwindSafe(|| {
+        // Test hook for the exit-code-4 contract; compiled out of release builds.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("ZAAF_INTERNAL_PANIC_TEST").is_some_and(|v| v == "1") {
+            panic!("zaaf internal panic test");
+        }
+        match cli.command {
+            Command::Check(args) => check::run(args),
+        }
     }))
     .unwrap_or(exit::INTERNAL);
     ExitCode::from(code)

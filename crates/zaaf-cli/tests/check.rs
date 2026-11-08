@@ -101,3 +101,120 @@ fn missing_path_and_bad_pipeline() {
         .code(2)
         .stderr(predicate::str::contains("invalid pipeline"));
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn internal_panic_exits_four() {
+    zaaf()
+        .env("ZAAF_INTERNAL_PANIC_TEST", "1")
+        .args(["check", "."])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("zaaf internal panic test"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_rule_file_is_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("good.yml"), GOOD).unwrap();
+    fs::write(
+        real.path().join("other.yml"),
+        GOOD.replace("r-whoami", "r-other"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(real.path().join("other.yml"), dir.path().join("link.yml")).unwrap();
+    zaaf()
+        .arg("check")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("checked 2 files: 2 rules"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_loop_is_an_error_not_a_hang() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("good.yml"), GOOD).unwrap();
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+    zaaf()
+        .arg("check")
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("cannot read directory"));
+}
+
+#[test]
+fn walk_errors_and_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.YML"), GOOD).unwrap();
+    fs::write(dir.path().join("b.Yaml"), GOOD.replace("r-whoami", "r-b")).unwrap();
+    zaaf()
+        .arg("check")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("checked 2 files: 2 rules"));
+}
+
+#[test]
+fn yaml_extension_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.yaml"), GOOD).unwrap();
+    zaaf()
+        .arg("check")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("checked 1 files: 1 rules"));
+}
+
+#[test]
+fn duplicate_inputs_are_deduped() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("good.yml");
+    fs::write(&f, GOOD).unwrap();
+    zaaf()
+        .arg("check")
+        .arg(&f)
+        .arg(&f)
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("checked 1 files: 1 rules")
+                .and(predicate::str::contains("0 errors")),
+        );
+}
+
+#[test]
+fn no_rule_files_warns_and_quiet_hides_it() {
+    let dir = tempfile::tempdir().unwrap();
+    zaaf()
+        .arg("check")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no rule files found"));
+    zaaf()
+        .args(["check", "-q"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no rule files found").not());
+}
+
+#[test]
+fn quiet_keeps_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("bad.yml"), BAD).unwrap();
+    zaaf()
+        .args(["check", "-q"])
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("unknown modifier"));
+}
