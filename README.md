@@ -108,10 +108,13 @@ To keep rules from exhausting memory or time, ZAAFElegia enforces these limits:
 - Condition nesting depth: at most 64.
 - Value expansion (for example a modifier chain over a list): at most 4,096 variants.
 - Predicates per detection item: at most 16,384.
-- Per rule: at most 65,536 weight units (a regular expression counts as 16).
+- Per rule: at most 65,536 weight units (a regular expression counts as 16, 256, 1,024 or 4,096).
 - Per run: at most 1,000,000 weight units across all loaded rules.
-- Regular expressions: at most 1 MiB compiled size (program and lazy-DFA cache). A larger
-  pattern is a rule error naming the limit.
+- Regular expressions are weighed by compiled size (program plus lazy-DFA cache). The smallest
+  tier a pattern fits decides its weight: up to 16 KiB is 16 units, 256 KiB is 256, 1 MiB is
+  1,024 and 4 MiB is 4,096, so one unit is about 1 KiB. A pattern above 4 MiB is a rule error
+  naming the limit. With the budgets above, compiled regexes use at most about 64 MiB per
+  rule and about 1 GiB per run.
 - Regular expressions use a linear-time engine. Patterns it cannot run fall back to a
   backtracking engine capped at 1,000,000 steps. Hitting that cap counts as no match, and
   `zaaf hunt` prints a warning naming the rule.

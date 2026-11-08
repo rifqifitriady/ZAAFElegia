@@ -1,7 +1,8 @@
 //! Compiles whole documents: search identifiers, conditions, meta filters and metadata.
 //!
-//! Work is bounded by predicate budgets. A regex predicate weighs [`REGEX_WEIGHT`] units,
-//! every other predicate 1. One rule (or filter) may weigh at most [`MAX_RULE_PREDICATES`]
+//! Work is bounded by predicate budgets. A regex predicate weighs 16, 256, 1024 or 4096 units by
+//! the smallest compiled-size tier (16 KiB, 256 KiB, 1 MiB, 4 MiB) it fits, so one unit is
+//! about 1 KiB of compiled regex; every other predicate weighs 1. One rule (or filter) may weigh at most [`MAX_RULE_PREDICATES`]
 //! units, and one `compile` call at most [`MAX_TOTAL_WEIGHT`] across all rules and filters;
 //! the first document that would cross it and every later one are skipped with a single
 //! error. A single item is capped at 16384 plain predicates. The SigmaHQ corpus (about
@@ -126,8 +127,6 @@ fn warning(source: &Option<PathBuf>, location: Location, msg: String) -> Diagnos
     located(Diagnostic::warning(location, msg), source)
 }
 
-/// Weight of a regex predicate in the budgets (other predicates weigh 1).
-pub const REGEX_WEIGHT: usize = 16;
 /// Upper bound on the weight of one rule (or filter) after condition resolution.
 pub const MAX_RULE_PREDICATES: usize = 65_536;
 /// Upper bound on the summed weight of all rules and filters in one `compile` call.
@@ -1014,13 +1013,34 @@ mod tests {
         let errs: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].message.contains("total compile budget of 1000000"));
-        let kept = MAX_TOTAL_WEIGHT / (3750 * REGEX_WEIGHT);
+        // Short patterns land in the smallest size tier, which weighs 16 units.
+        let kept = MAX_TOTAL_WEIGHT / (3750 * 16);
         assert_eq!(out.rules.len(), kept);
         assert!(
             errs[0]
                 .message
                 .contains(&format!("({} documents skipped)", 20 - kept))
         );
+    }
+
+    #[test]
+    fn mid_size_regexes_hit_the_rule_budget_before_compiling_them_all() {
+        // Each `\w{1,64}` weighs 4096 units; 17 exceed the 65536 per-rule budget.
+        let vals: Vec<String> = (1..=2000)
+            .map(|i| format!("'a\\w{{1,{}}}'", 60 + i % 5))
+            .collect();
+        let start = std::time::Instant::now();
+        let out = compile_detection_src(&format!(
+            "    s:\n        C|re: [{}]\n    condition: s\n",
+            vals.join(", ")
+        ));
+        assert!(out.rules.is_empty());
+        assert!(
+            first_error(&out).contains("more than 65536 predicates"),
+            "{}",
+            first_error(&out)
+        );
+        assert!(start.elapsed().as_secs() < 20);
     }
 
     #[test]

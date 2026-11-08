@@ -175,6 +175,8 @@ pub(crate) fn compile_item(
         }
         out_groups.push(vec![pred(Matcher::Null)]);
     } else if has(Re) {
+        // Bound the compiled memory of one item before compiling the next regex.
+        let mut regex_weight = 0usize;
         for g in &groups {
             let mut out = Vec::new();
             for v in g {
@@ -182,6 +184,13 @@ pub(crate) fn compile_item(
                     return Err("`re` needs string values".into());
                 };
                 let re = CompiledRegex::new(src, flags)?;
+                regex_weight += re.weight() as usize;
+                if regex_weight > crate::rule::MAX_RULE_PREDICATES {
+                    return Err(format!(
+                        "rule expands to more than {} predicates",
+                        crate::rule::MAX_RULE_PREDICATES
+                    ));
+                }
                 if re.needs_backtracking() {
                     warnings.push(format!(
                         "regex `{src}` needs the backtracking engine (limit {BACKTRACK_LIMIT} steps)"
@@ -367,13 +376,14 @@ fn expand_values(
     Ok(out)
 }
 
-/// Budget weight of an expression: regex predicates weigh `REGEX_WEIGHT`, all others 1.
+/// Budget weight of an expression: a regex predicate weighs its size-tier weight (16 to
+/// 4096 units, see `CompiledRegex::weight`), all others 1.
 pub(crate) fn weight(e: &Expr) -> usize {
     match e {
         Expr::And(v) | Expr::Or(v) => v.iter().map(weight).sum(),
         Expr::Not(e) => weight(e),
-        Expr::Pred(p) => match p.matcher {
-            Matcher::Regex(_) => crate::rule::REGEX_WEIGHT,
+        Expr::Pred(p) => match &p.matcher {
+            Matcher::Regex(re) => re.weight() as usize,
             _ => 1,
         },
     }

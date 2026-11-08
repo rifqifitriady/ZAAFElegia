@@ -6,7 +6,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum compiled size of one regular expression (program and lazy-DFA cache), in bytes.
-pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
+pub const REGEX_SIZE_LIMIT: usize = 4 << 20;
+
+/// Size tiers tried in order, with the budget weight of the first one that compiles
+/// (about 1 KiB of compiled size per unit in every tier).
+const SIZE_TIERS: &[(usize, u32)] = &[
+    (16 << 10, 16),
+    (256 << 10, 256),
+    (1 << 20, 1024),
+    (REGEX_SIZE_LIMIT, 4096),
+];
+
+enum BuildError {
+    TooBig,
+    Invalid(String),
+}
 
 /// Maximum backtracking steps for patterns that need the backtracking engine.
 pub const BACKTRACK_LIMIT: usize = 1_000_000;
@@ -40,6 +54,7 @@ pub struct CompiledRegex {
     source: String,
     flags: RegexFlags,
     engine: Engine,
+    weight: u32,
     /// Backtrack-limit hits; clones share the counter.
     limit_hits: Arc<AtomicU64>,
 }
@@ -54,60 +69,84 @@ impl CompiledRegex {
         flags: RegexFlags,
         limit: usize,
     ) -> Result<Self, String> {
+        for &(size, weight) in SIZE_TIERS {
+            match Self::build(source, flags, limit, size, weight) {
+                Err(BuildError::TooBig) => continue,
+                Err(BuildError::Invalid(msg)) => return Err(msg),
+                Ok(re) => return Ok(re),
+            }
+        }
+        Err(too_big(source))
+    }
+
+    fn build(
+        source: &str,
+        flags: RegexFlags,
+        limit: usize,
+        size: usize,
+        weight: u32,
+    ) -> Result<Self, BuildError> {
         let linear = regex::RegexBuilder::new(source)
             .case_insensitive(flags.insensitive)
             .multi_line(flags.multiline)
             .dot_matches_new_line(flags.dot_all)
-            .size_limit(REGEX_SIZE_LIMIT)
-            .dfa_size_limit(REGEX_SIZE_LIMIT)
+            .size_limit(size)
+            .dfa_size_limit(size)
             .build();
-        if let Err(regex::Error::CompiledTooBig(_)) = &linear {
-            return Err(too_big(source));
+        let linear_err = match linear {
+            Ok(re) => {
+                return Ok(Self {
+                    source: source.to_string(),
+                    flags,
+                    engine: Engine::Linear(re),
+                    weight,
+                    limit_hits: Arc::default(),
+                });
+            }
+            Err(regex::Error::CompiledTooBig(_)) => return Err(BuildError::TooBig),
+            Err(e) => e,
+        };
+        let mut inline = String::new();
+        if flags.insensitive {
+            inline.push('i');
         }
-        match linear {
-            Ok(re) => Ok(Self {
+        if flags.multiline {
+            inline.push('m');
+        }
+        if flags.dot_all {
+            inline.push('s');
+        }
+        let pattern = if inline.is_empty() {
+            source.to_string()
+        } else {
+            format!("(?{inline}){source}")
+        };
+        fancy_regex::RegexBuilder::new(&pattern)
+            .backtrack_limit(limit)
+            .delegate_size_limit(size)
+            .delegate_dfa_size_limit(size)
+            .build()
+            .map(|re| Self {
                 source: source.to_string(),
                 flags,
-                engine: Engine::Linear(re),
+                engine: Engine::Backtracking(re),
+                weight,
                 limit_hits: Arc::default(),
-            }),
-            Err(linear_err) => {
-                let mut inline = String::new();
-                if flags.insensitive {
-                    inline.push('i');
+            })
+            .map_err(|fancy_err| {
+                if is_too_big(&fancy_err) {
+                    return BuildError::TooBig;
                 }
-                if flags.multiline {
-                    inline.push('m');
-                }
-                if flags.dot_all {
-                    inline.push('s');
-                }
-                let pattern = if inline.is_empty() {
-                    source.to_string()
-                } else {
-                    format!("(?{inline}){source}")
-                };
-                fancy_regex::RegexBuilder::new(&pattern)
-                    .backtrack_limit(limit)
-                    .delegate_size_limit(REGEX_SIZE_LIMIT)
-                    .delegate_dfa_size_limit(REGEX_SIZE_LIMIT)
-                    .build()
-                    .map(|re| Self {
-                        source: source.to_string(),
-                        flags,
-                        engine: Engine::Backtracking(re),
-                        limit_hits: Arc::default(),
-                    })
-                    .map_err(|fancy_err| {
-                        if is_too_big(&fancy_err) {
-                            return too_big(source);
-                        }
-                        format!(
-                            "invalid regular expression `{source}`: {linear_err}; backtracking engine: {fancy_err}"
-                        )
-                    })
-            }
-        }
+                BuildError::Invalid(format!(
+                    "invalid regular expression `{source}`: {linear_err}; backtracking engine: {fancy_err}"
+                ))
+            })
+    }
+
+    /// Budget weight in units of about 1 KiB of compiled size: 16, 256, 1024 or 4096,
+    /// by the smallest size tier the pattern compiled under.
+    pub fn weight(&self) -> u32 {
+        self.weight
     }
 
     /// Unanchored search. A pattern that exceeds the backtracking limit does not
@@ -248,6 +287,19 @@ mod tests {
         let big_fancy = format!(r"(?=a){}", r"\w{200}".repeat(50));
         let err = CompiledRegex::new(&big_fancy, RegexFlags::default()).unwrap_err();
         assert!(err.contains("size limit"), "{err}");
+    }
+
+    #[test]
+    fn weights_follow_the_size_tier() {
+        let w = |p: &str| {
+            CompiledRegex::new(p, RegexFlags::default())
+                .unwrap()
+                .weight()
+        };
+        assert_eq!(w("^admin$"), 16);
+        assert_eq!(w(r"\w{1,64}"), 4096);
+        assert_eq!(w(r"(?=a)\w{1,64}"), 4096);
+        assert!(CompiledRegex::new(r"\w{200}", RegexFlags::default()).is_err());
     }
 
     #[test]
