@@ -3,5 +3,5 @@ id: c029-4
 logsource: {product: test}
 detection:
     selection:
-        C|exists|contains: true
+        X|exists|contains: true
     condition: selection

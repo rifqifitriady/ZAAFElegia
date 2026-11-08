@@ -46,3 +46,100 @@ fn event_count_mismatch_is_reported() {
         result.failures
     );
 }
+
+#[test]
+fn missing_events_file_is_reported() {
+    let dir = write_case("  - [r]\n  - []\n");
+    fs::remove_file(dir.path().join("events.ndjson")).unwrap();
+    let result = zaaf_testkit::run_case(dir.path());
+    assert!(!result.passed());
+    assert!(
+        result.failures[0].contains("events.ndjson"),
+        "{:?}",
+        result.failures
+    );
+}
+
+#[test]
+fn missing_rules_directory_is_reported() {
+    let dir = write_case("  - [r]\n  - []\n");
+    fs::remove_dir_all(dir.path().join("rules")).unwrap();
+    let result = zaaf_testkit::run_case(dir.path());
+    assert!(!result.passed());
+    assert!(
+        result.failures.iter().any(|f| f.contains("rules")),
+        "{:?}",
+        result.failures
+    );
+}
+
+#[test]
+fn empty_rules_directory_is_reported() {
+    let dir = write_case("  - []\n  - []\n");
+    fs::remove_file(dir.path().join("rules/r.yml")).unwrap();
+    let result = zaaf_testkit::run_case(dir.path());
+    assert!(
+        !result.passed(),
+        "a case with no rules must not pass vacuously"
+    );
+}
+
+#[test]
+fn empty_expected_is_reported() {
+    let dir = write_case("  - [r]\n  - []\n");
+    fs::write(
+        dir.path().join("case.yml"),
+        "spec_ref: t\ndescription: d\nexpected: []\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("events.ndjson"), "").unwrap();
+    let result = zaaf_testkit::run_case(dir.path());
+    assert!(
+        !result.passed(),
+        "an empty expected list must not pass vacuously"
+    );
+}
+
+#[test]
+fn error_count_mismatch_is_reported() {
+    let dir = write_case("  - [r]\n  - []\n");
+    fs::write(dir.path().join("rules/bad.yml"), "title: bad\nid: bad\nlogsource: {product: t}\ndetection:\n    s:\n        A|nope: x\n    condition: s\n").unwrap();
+    let result = zaaf_testkit::run_case(dir.path());
+    assert!(
+        result
+            .failures
+            .iter()
+            .any(|f| f.contains("expected 0 rule errors, got 1")),
+        "{:?}",
+        result.failures
+    );
+}
+
+#[test]
+fn unknown_case_key_is_reported() {
+    let dir = write_case("  - [r]\n  - []\n");
+    fs::write(
+        dir.path().join("case.yml"),
+        "spec_ref: t\ndescription: d\nexpeced_typo: 1\nexpected:\n  - [r]\n  - []\n",
+    )
+    .unwrap();
+    let result = zaaf_testkit::run_case(dir.path());
+    assert!(
+        result.failures[0].contains("case.yml"),
+        "{:?}",
+        result.failures
+    );
+}
+
+#[test]
+fn directory_without_case_yml_is_reported_by_the_suite() {
+    let root = tempfile::tempdir().unwrap();
+    let case = write_case("  - [r]\n  - []\n");
+    fs::remove_file(case.path().join("case.yml")).unwrap();
+    let target = root.path().join("typo-case");
+    fs::create_dir(&target).unwrap();
+    fs::rename(case.path().join("rules"), target.join("rules")).unwrap();
+    let results = zaaf_testkit::run_suite(root.path()).unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].passed(), "{:?}", results[0].failures);
+}

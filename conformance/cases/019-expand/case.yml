@@ -1,5 +1,5 @@
 spec_ref: sigma-rules-specification.md#placeholders
-description: '`expand` replaces %name% with pipeline values (wildcards allowed); without `expand` the text is literal.'
+description: '`expand` replaces %name% with pipeline values (values may contain wildcards, interpretation 14); without `expand` the text is literal.'
 pipelines: [pipeline.yml]
 expected:
   - [c019]

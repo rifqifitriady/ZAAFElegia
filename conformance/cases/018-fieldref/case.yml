@@ -1,6 +1,6 @@
 spec_ref: sigma-appendix-modifiers.md#specific-modifiers (fieldref)
-description: '`fieldref` compares two fields of the same event; combined with `contains` it is a substring test. A missing field never matches.'
+description: '`fieldref` compares two fields of the same event; the comparison is case-insensitive like every other string, and it combines with exactly one of `contains`, `startswith` or `endswith`. A missing field never matches.'
 expected:
-  - [c018-contains, c018-eq]
+  - [c018-contains, c018-ends, c018-eq, c018-starts]
   - []
   - []

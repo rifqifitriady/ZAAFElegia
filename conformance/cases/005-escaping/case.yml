@@ -5,5 +5,5 @@ expected:
   - []
   - [c005-bs-star]
   - [c005-bs-star, c005-triple]
-  - [c005-bs-star, c005-quad]
+  - [c005-bs-star, c005-quad, c005-three]
   - [c005-bs-star, c005-single]

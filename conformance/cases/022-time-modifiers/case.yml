@@ -1,6 +1,7 @@
 spec_ref: sigma-appendix-modifiers.md#time-modifiers
-description: Time modifiers extract a number (UTC) from a timestamp value; they combine with numeric comparisons. Unparseable values never match.
+description: 'Time modifiers extract a number in UTC (a `+07:00` timestamp at 03:15 is hour 20, so it matches neither `hour: 3` nor `hour|gte: 22`) from a timestamp value; they combine with numeric comparisons. Unparseable values never match.'
 expected:
   - [c022-hour]
   - [c022-night]
+  - []
   - []

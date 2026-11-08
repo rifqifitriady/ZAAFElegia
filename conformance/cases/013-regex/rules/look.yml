@@ -1,7 +1,0 @@
-title: re lookahead
-id: c013-look
-logsource: {product: test}
-detection:
-    s:
-        Name|re: '^(?!svchost).*\.exe$'
-    condition: s

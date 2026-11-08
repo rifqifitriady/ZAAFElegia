@@ -43,10 +43,29 @@ pub fn run_suite(root: &Path) -> Result<Vec<CaseResult>, String> {
     let entries = fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
     let mut dirs: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.join("case.yml").is_file())
+        .filter(|p| p.is_dir())
         .collect();
     dirs.sort();
-    Ok(dirs.iter().map(|d| run_case(d)).collect())
+    Ok(dirs
+        .iter()
+        .filter_map(|d| {
+            if d.join("case.yml").is_file() {
+                Some(run_case(d))
+            } else if d.join("rules").exists() || d.join("events.ndjson").exists() {
+                // Looks like a case but has no case.yml: most likely a typo, never skip silently.
+                let name = d
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some(CaseResult {
+                    name,
+                    failures: vec!["directory has rules/ or events.ndjson but no case.yml".into()],
+                })
+            } else {
+                None
+            }
+        })
+        .collect())
 }
 
 fn yaml_files(dir: &Path) -> Vec<PathBuf> {
@@ -78,12 +97,18 @@ pub fn run_case(dir: &Path) -> CaseResult {
         Ok(s) => s,
         Err(e) => return fail(format!("case.yml: {e}")),
     };
+    if spec.expected.is_empty() {
+        return fail("case.yml: `expected` must list at least one event".into());
+    }
     let pipeline_paths: Vec<PathBuf> = spec.pipelines.iter().map(|p| dir.join(p)).collect();
     let pipelines = match PipelineSet::load(&pipeline_paths) {
         Ok(p) => p,
         Err(d) => return fail(d.to_string()),
     };
 
+    if !dir.join("rules").is_dir() {
+        return fail("rules/ directory is missing".into());
+    }
     let mut docs = Vec::new();
     let mut errors = Vec::new();
     for f in yaml_files(&dir.join("rules")) {
@@ -98,6 +123,9 @@ pub fn run_case(dir: &Path) -> CaseResult {
                     source: Some(f.clone()),
                 }),
         );
+    }
+    if docs.is_empty() && errors.is_empty() {
+        return fail("rules/ contains no rule documents".into());
     }
     let out = compile(docs, &pipelines);
     errors.extend(out.diagnostics.into_iter().filter(|d| d.is_error()));

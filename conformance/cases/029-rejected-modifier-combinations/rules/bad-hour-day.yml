@@ -3,5 +3,5 @@ id: c029-2
 logsource: {product: test}
 detection:
     selection:
-        C|hour|day: 1
+        T|hour|day: 7
     condition: selection

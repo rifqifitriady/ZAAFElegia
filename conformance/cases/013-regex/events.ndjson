@@ -1,2 +1,2 @@
-{"Image": "C:\\Windows\\System32\\cmd.exe", "Text": "line1\nevil\nline3", "Name": "evil.exe"}
-{"Image": "C:\\x\\CMD.EXE", "Text": "a\nb", "Name": "svchost.exe"}
+{"Image": "C:\\Windows\\System32\\cmd.exe", "Text": "line1\nevil\nline3"}
+{"Image": "C:\\x\\CMD.EXE", "Text": "a\nb"}

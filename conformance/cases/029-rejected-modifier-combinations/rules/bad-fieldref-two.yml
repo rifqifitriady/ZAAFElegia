@@ -3,5 +3,5 @@ id: c029-5
 logsource: {product: test}
 detection:
     selection:
-        C|fieldref|startswith|contains: B
+        F|fieldref|startswith|contains: B
     condition: selection

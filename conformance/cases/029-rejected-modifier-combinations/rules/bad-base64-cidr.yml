@@ -3,5 +3,5 @@ id: c029-3
 logsource: {product: test}
 detection:
     selection:
-        C|base64|cidr: 10.0.0.0/8
+        E|base64|cidr: 10.0.0.0/8
     condition: selection
