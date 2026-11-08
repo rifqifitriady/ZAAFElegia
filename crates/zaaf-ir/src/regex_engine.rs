@@ -5,8 +5,22 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Maximum compiled size of one regular expression (program and lazy-DFA cache), in bytes.
+pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
 /// Maximum backtracking steps for patterns that need the backtracking engine.
 pub const BACKTRACK_LIMIT: usize = 1_000_000;
+
+fn too_big(source: &str) -> String {
+    format!(
+        "regular expression `{source}` exceeds the compiled size limit of {REGEX_SIZE_LIMIT} bytes"
+    )
+}
+
+fn is_too_big(e: &fancy_regex::Error) -> bool {
+    // The size-limit failure is only visible in the error's Debug form.
+    format!("{e:?}").contains("ExceededSizeLimit")
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegexFlags {
@@ -44,7 +58,12 @@ impl CompiledRegex {
             .case_insensitive(flags.insensitive)
             .multi_line(flags.multiline)
             .dot_matches_new_line(flags.dot_all)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .dfa_size_limit(REGEX_SIZE_LIMIT)
             .build();
+        if let Err(regex::Error::CompiledTooBig(_)) = &linear {
+            return Err(too_big(source));
+        }
         match linear {
             Ok(re) => Ok(Self {
                 source: source.to_string(),
@@ -70,6 +89,8 @@ impl CompiledRegex {
                 };
                 fancy_regex::RegexBuilder::new(&pattern)
                     .backtrack_limit(limit)
+                    .delegate_size_limit(REGEX_SIZE_LIMIT)
+                    .delegate_dfa_size_limit(REGEX_SIZE_LIMIT)
                     .build()
                     .map(|re| Self {
                         source: source.to_string(),
@@ -78,6 +99,9 @@ impl CompiledRegex {
                         limit_hits: Arc::default(),
                     })
                     .map_err(|fancy_err| {
+                        if is_too_big(&fancy_err) {
+                            return too_big(source);
+                        }
                         format!(
                             "invalid regular expression `{source}`: {linear_err}; backtracking engine: {fancy_err}"
                         )
@@ -212,6 +236,24 @@ mod tests {
         let re = CompiledRegex::new(r"^(?!svchost).*\.exe$", RegexFlags::default()).unwrap();
         assert!(re.is_match("evil.exe"));
         assert_eq!(re.limit_hits(), 0);
+    }
+
+    #[test]
+    fn oversized_pattern_is_a_compile_error_naming_the_limit() {
+        let big = r"\w{200}".repeat(50);
+        let err = CompiledRegex::new(&big, RegexFlags::default()).unwrap_err();
+        assert!(err.contains("size limit"), "{err}");
+        assert!(err.contains(&REGEX_SIZE_LIMIT.to_string()), "{err}");
+        // A backtracking-only pattern is bounded too.
+        let big_fancy = format!(r"(?=a){}", r"\w{200}".repeat(50));
+        let err = CompiledRegex::new(&big_fancy, RegexFlags::default()).unwrap_err();
+        assert!(err.contains("size limit"), "{err}");
+    }
+
+    #[test]
+    fn normal_patterns_compile_under_the_size_limit() {
+        CompiledRegex::new(r"\w{20}", RegexFlags::default()).unwrap();
+        CompiledRegex::new(r"(?i)^[a-z0-9_\-\.]{1,64}\.exe$", RegexFlags::default()).unwrap();
     }
 
     #[test]
