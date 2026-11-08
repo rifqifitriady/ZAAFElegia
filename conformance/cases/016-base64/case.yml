@@ -1,7 +1,8 @@
 spec_ref: sigma-appendix-modifiers.md#encoding
-description: '`base64` encodes the value; `base64offset` produces the three offset variants (pySigma algorithm). Encoded values match case-insensitively (interpretation 5): the last event differs from the encoded text only in letter case.'
+description: '`base64` encodes the value; `base64offset` produces the three offset variants (pySigma algorithm). Encoded values match case-insensitively (interpretation 5): the last two events differ from the encoded text only in letter case (one per rule).'
 expected:
   - [c016-b64]
   - [c016-off]
   - []
   - [c016-b64]
+  - [c016-off]

@@ -3,5 +3,5 @@ id: c029-1
 logsource: {product: test}
 detection:
     selection:
-        N|gt|lt: 3
+        N|gte|lte: 5
     condition: selection
