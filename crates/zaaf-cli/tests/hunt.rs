@@ -143,3 +143,156 @@ fn regex_limit_hits_are_reported_without_changing_exit_code() {
                 .and(predicate::str::contains("r-backtrack")),
         );
 }
+
+fn backtrack_rule(dir: &Path) {
+    fs::write(
+        dir.join("rules/re.yml"),
+        "title: Backtrack\nid: r-backtrack\nstatus: test\nlevel: high\nlogsource:\n    product: test\ndetection:\n    sel:\n        CommandLine|re: '^(a|a)*\\1$'\n    condition: sel\n",
+    )
+    .unwrap();
+}
+
+fn only_rule(rules: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("rules")).unwrap();
+    fs::write(dir.path().join("rules/r.yml"), rules).unwrap();
+    dir
+}
+
+#[test]
+fn unreadable_input_exits_three_after_processing_others() {
+    let dir = setup();
+    hunt(dir.path())
+        .arg(dir.path().join("missing.ndjson"))
+        .args(["-o", "ndjson"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("r-whoami"))
+        .stderr(predicate::str::contains("1 unreadable inputs"));
+}
+
+#[test]
+fn table_output_escapes_control_characters() {
+    let dir = only_rule(
+        "title: \"T\\rX \\e[31mred\"\nid: r-esc\nstatus: test\nlevel: low\nlogsource:\n    product: test\ndetection:\n    sel:\n        CommandLine|contains: whoami\n    condition: sel\n",
+    );
+    fs::write(
+        dir.path().join("e.ndjson"),
+        "{\"CommandLine\": \"whoami\"}\n",
+    )
+    .unwrap();
+    let out = zaaf()
+        .arg("hunt")
+        .arg("-r")
+        .arg(dir.path().join("rules"))
+        .args(["-o", "table"])
+        .arg(dir.path().join("e.ndjson"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
+    assert!(text.contains("\\x1b"), "{text:?}");
+}
+
+#[test]
+fn regex_warning_on_max_errors_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("rules")).unwrap();
+    backtrack_rule(dir.path());
+    let ev = format!(
+        "{{\"CommandLine\": \"{}b\"}}\nbad\nbad\nbad\n",
+        "a".repeat(40)
+    );
+    fs::write(dir.path().join("events.ndjson"), ev).unwrap();
+    hunt(dir.path())
+        .args(["--max-errors", "1"])
+        .assert()
+        .code(3)
+        .stderr(
+            predicate::str::contains("hit the backtracking limit")
+                .and(predicate::str::contains("r-backtrack")),
+        );
+}
+
+#[test]
+fn filters_removing_all_rules_say_so() {
+    let dir = setup();
+    hunt(dir.path())
+        .args(["--min-level", "critical", "--status", "test"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "no rules left after --min-level/--status filters",
+        ));
+}
+
+#[test]
+fn to_bound_and_missing_timestamp_and_bad_from() {
+    let dir = setup();
+    hunt(dir.path())
+        .args(["--to", "2026-11-07T01:30:00Z", "-o", "csv"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("r-whoami").and(predicate::str::contains("r-mimi").not()))
+        .stderr(predicate::str::contains("outside time range"));
+    zaaf()
+        .arg("hunt")
+        .arg("-r")
+        .arg(dir.path().join("rules"))
+        .args(["--from", "2030-01-01T00:00:00Z", "-o", "csv", "-"])
+        .write_stdin("{\"CommandLine\": \"whoami\"}\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("r-whoami"));
+    hunt(dir.path())
+        .args(["--from", "garbage"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn max_errors_boundary() {
+    let dir = setup();
+    fs::write(dir.path().join("events.ndjson"), "bad\nbad\n").unwrap();
+    hunt(dir.path())
+        .args(["--max-errors", "2"])
+        .assert()
+        .code(0);
+    hunt(dir.path())
+        .args(["--max-errors", "1"])
+        .assert()
+        .code(3);
+}
+
+#[test]
+fn mixed_stdin_and_file_inputs() {
+    let dir = setup();
+    zaaf()
+        .arg("hunt")
+        .arg("-r")
+        .arg(dir.path().join("rules"))
+        .args(["-o", "ndjson", "-"])
+        .arg(dir.path().join("events.ndjson"))
+        .write_stdin("{\"CommandLine\": \"whoami\"}\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<stdin>").and(predicate::str::contains("events.ndjson")))
+        .stderr(predicate::str::contains("4 events"));
+}
+
+#[test]
+fn strict_malformed_beats_fail_on_match() {
+    let dir = setup();
+    fs::write(
+        dir.path().join("events.ndjson"),
+        "{\"CommandLine\": \"whoami\"}\nnot json\n",
+    )
+    .unwrap();
+    hunt(dir.path())
+        .args(["--strict", "--fail-on-match"])
+        .assert()
+        .code(3);
+}

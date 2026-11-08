@@ -139,7 +139,7 @@ impl<W: Write> Sink<W> {
                 let mut table = comfy_table::Table::new();
                 table.set_header(vec!["Time", "Level", "Rule", "Title", "Source"]);
                 for r in &self.rows {
-                    table.add_row(r.to_vec());
+                    table.add_row(r.iter().map(|c| sanitize_cell(c)).collect::<Vec<_>>());
                 }
                 writeln!(self.out, "{table}")?;
             }
@@ -165,11 +165,31 @@ fn row(f: &Value) -> [String; 5] {
     ]
 }
 
+/// Replaces control characters with visible `\xNN` escapes so table cells cannot
+/// inject terminal escape sequences.
+fn sanitize_cell(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                format!("\\x{:02x}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn csv_field(s: &str) -> String {
-    if s.contains(&[',', '"', '\n'][..]) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+    // Neutralise spreadsheet formula injection, then apply RFC 4180 quoting.
+    let cell = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{s}")
     } else {
         s.to_string()
+    };
+    if cell.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", cell.replace('"', "\"\""))
+    } else {
+        cell
     }
 }
 
@@ -229,6 +249,26 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\"T, \"\"quoted\"\"\""), "{text}");
+    }
+
+    #[test]
+    fn csv_neutralises_formulas_and_quotes_cr() {
+        assert_eq!(csv_field("=1+1"), "'=1+1");
+        assert_eq!(csv_field("@x"), "'@x");
+        assert_eq!(csv_field("-1"), "'-1");
+        assert_eq!(csv_field("+1"), "'+1");
+        assert_eq!(csv_field("\tx"), "'\tx");
+        assert_eq!(csv_field("a\rb"), "\"a\rb\"");
+        assert_eq!(csv_field("=a,b"), "\"'=a,b\"");
+        assert_eq!(csv_field("plain"), "plain");
+    }
+
+    #[test]
+    fn table_cells_escape_control_chars() {
+        assert_eq!(
+            sanitize_cell("a\u{1b}[31m\rb\tc é"),
+            "a\\x1b[31m\\x0db\\x09c é"
+        );
     }
 
     #[test]

@@ -77,6 +77,8 @@ pub struct HuntArgs {
 struct Stats {
     events: u64,
     input_errors: usize,
+    open_errors: usize,
+    out_of_range: u64,
     matches: u64,
 }
 
@@ -134,6 +136,7 @@ pub fn run(args: HuntArgs) -> u8 {
         eprintln!("error: {rule_errors} rule errors (--strict)");
         return exit::RULE_ERRORS;
     }
+    let rules_before = loaded.output.rules.len();
     let min = args.min_level.map(Level::from);
     let rules: Vec<CompiledRule> = loaded
         .output
@@ -142,11 +145,40 @@ pub fn run(args: HuntArgs) -> u8 {
         .filter(|r| keep(r, min, &args.status))
         .collect();
     if rules.is_empty() {
-        eprintln!("error: no rules to run");
+        if rules_before > 0 {
+            eprintln!("error: no rules left after --min-level/--status filters");
+        } else {
+            eprintln!("error: no rules to run");
+        }
         return exit::RULE_ERRORS;
     }
     let rule_count = rules.len();
     let evaluator = Evaluator::new(rules);
+    let code = scan(&args, &evaluator, from, to, rule_count);
+    warn_regex_limits(&evaluator);
+    code
+}
+
+fn warn_regex_limits(evaluator: &Evaluator) {
+    for (idx, hits) in evaluator.regex_limit_hits() {
+        let info = &evaluator.rules()[idx].info;
+        eprintln!(
+            "warning: rule `{}` ({}): {hits} regex evaluation(s) hit the backtracking limit and were treated as no match",
+            info.title, info.id
+        );
+    }
+}
+
+/// Exit-code precedence when several conditions hold: 4 > 3 > 2 > 1 > 0.
+/// Unreadable inputs always give 3; malformed records give 3 only with
+/// `--strict` (or past `--max-errors`); `--fail-on-match` (1) loses to both.
+fn scan(
+    args: &HuntArgs,
+    evaluator: &Evaluator,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    rule_count: usize,
+) -> u8 {
     let format = args.output.unwrap_or(if io::stdout().is_terminal() {
         OutputFormat::Table
     } else {
@@ -176,7 +208,7 @@ pub fn run(args: HuntArgs) -> u8 {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("error: {name}: {e}");
-                stats.input_errors += 1;
+                stats.open_errors += 1;
                 continue;
             }
         };
@@ -205,6 +237,7 @@ pub fn run(args: HuntArgs) -> u8 {
             if let Some(ts) = event.timestamp()
                 && (from.is_some_and(|f| ts < f) || to.is_some_and(|t| ts > t))
             {
+                stats.out_of_range += 1;
                 continue;
             }
             for idx in evaluator.matching_rules(&event) {
@@ -220,18 +253,16 @@ pub fn run(args: HuntArgs) -> u8 {
     if let Err(e) = sink.finish() {
         return write_failed(e);
     }
+    let range_note = if stats.out_of_range > 0 {
+        format!(" ({} outside time range)", stats.out_of_range)
+    } else {
+        String::new()
+    };
     eprintln!(
-        "{} events, {} malformed records, {rule_count} rules, {} matches",
-        stats.events, stats.input_errors, stats.matches
+        "{} events{range_note}, {} malformed records, {} unreadable inputs, {rule_count} rules, {} matches",
+        stats.events, stats.input_errors, stats.open_errors, stats.matches
     );
-    for (idx, hits) in evaluator.regex_limit_hits() {
-        let info = &evaluator.rules()[idx].info;
-        eprintln!(
-            "warning: rule `{}` ({}): {hits} regex evaluation(s) hit the backtracking limit and were treated as no match",
-            info.title, info.id
-        );
-    }
-    if args.strict && stats.input_errors > 0 {
+    if stats.open_errors > 0 || (args.strict && stats.input_errors > 0) {
         return exit::INPUT_ERRORS;
     }
     if args.fail_on_match && stats.matches > 0 {
