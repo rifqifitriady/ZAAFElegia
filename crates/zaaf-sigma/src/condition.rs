@@ -63,14 +63,26 @@ fn tokenize(s: &str) -> Result<Vec<T>, String> {
     Ok(out)
 }
 
+/// Maximum nesting of `(` groups and `not` operators.
+const MAX_DEPTH: usize = 64;
+
 struct Parser {
     toks: Vec<T>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
     fn is_kw(&self, kw: &str) -> bool {
         matches!(self.toks.get(self.pos), Some(T::Word(w)) if w.eq_ignore_ascii_case(kw))
+    }
+
+    fn enter(&mut self) -> Result<(), String> {
+        if self.depth >= MAX_DEPTH {
+            return Err(format!("condition nested too deeply (limit {MAX_DEPTH})"));
+        }
+        self.depth += 1;
+        Ok(())
     }
 
     fn expr(&mut self) -> Result<CondExpr, String> {
@@ -102,7 +114,10 @@ impl Parser {
     fn not_expr(&mut self) -> Result<CondExpr, String> {
         if self.is_kw("not") {
             self.pos += 1;
-            return Ok(CondExpr::Not(Box::new(self.not_expr()?)));
+            self.enter()?;
+            let inner = self.not_expr();
+            self.depth -= 1;
+            return Ok(CondExpr::Not(Box::new(inner?)));
         }
         self.primary()
     }
@@ -111,7 +126,10 @@ impl Parser {
         match self.toks.get(self.pos).cloned() {
             Some(T::LParen) => {
                 self.pos += 1;
-                let e = self.expr()?;
+                self.enter()?;
+                let e = self.expr();
+                self.depth -= 1;
+                let e = e?;
                 if self.toks.get(self.pos) == Some(&T::RParen) {
                     self.pos += 1;
                     Ok(e)
@@ -131,7 +149,10 @@ impl Parser {
                         Quantifier::One
                     };
                     let target = match self.toks.get(self.pos).cloned() {
-                        Some(T::Word(t)) => {
+                        Some(T::Word(t))
+                            if !["and", "or", "not", "of"]
+                                .contains(&t.to_ascii_lowercase().as_str()) =>
+                        {
                             self.pos += 1;
                             if t.eq_ignore_ascii_case("them") {
                                 SelTarget::Them
@@ -140,7 +161,9 @@ impl Parser {
                             }
                         }
                         _ => {
-                            return Err(format!("`{w} of` must be followed by `them` or a pattern"));
+                            return Err(format!(
+                                "`{w} of` must be followed by `them` or a pattern"
+                            ));
                         }
                     };
                     return Ok(CondExpr::Of(q, target));
@@ -162,7 +185,11 @@ pub fn parse_condition(s: &str) -> Result<CondExpr, String> {
     if toks.is_empty() {
         return Err("empty condition".into());
     }
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     let e = p.expr()?;
     if p.pos != p.toks.len() {
         return Err(format!("unexpected token after position {}", p.pos));
@@ -234,5 +261,32 @@ mod tests {
         }
         let agg = parse_condition("sel | count() > 5").unwrap_err();
         assert!(agg.contains("correlation rule"), "{agg}");
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_not_a_crash() {
+        let parens = "(".repeat(10_000) + "a" + &")".repeat(10_000);
+        let err = parse_condition(&parens).unwrap_err();
+        assert!(err.contains("nested too deeply"), "{err}");
+
+        let nots = "not ".repeat(10_000) + "a";
+        let err = parse_condition(&nots).unwrap_err();
+        assert!(err.contains("nested too deeply"), "{err}");
+    }
+
+    #[test]
+    fn moderate_nesting_still_parses() {
+        assert_eq!(parse_condition("((((a))))").unwrap(), id("a"));
+        assert_eq!(
+            parse_condition("not not a").unwrap(),
+            CondExpr::Not(Box::new(CondExpr::Not(Box::new(id("a")))))
+        );
+    }
+
+    #[test]
+    fn reserved_words_are_not_patterns() {
+        for bad in ["1 of and", "all of not", "1 of OR", "all of Of"] {
+            assert!(parse_condition(bad).is_err(), "should reject {bad:?}");
+        }
     }
 }
