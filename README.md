@@ -12,7 +12,7 @@ It does not convert them to another query language first.
 ## Why ZAAFElegia
 
 - **Conformance you can check.**
-  - A public, language-neutral [conformance suite](conformance/README.md) for Sigma 2.1 (29 cases).
+  - A public, language-neutral [conformance suite](conformance/README.md) for Sigma 2.1 (30 cases).
   - A CI run that parses and compiles the whole SigmaHQ corpus (pinned to commit `53b90df`, see `scripts/sigmahq-corpus.sh`), with the bundled placeholder pipeline (`tests/sigmahq/placeholders.yml`): SigmaHQ corpus: 3807/3807 files parse and compile (100.00%). This measures parse and compile only, not detection accuracy.
 - **One rule, live and historical (planned, M4).** The same rule should give identical results on a stream and on Parquet.
 - **Detection for the AI era (planned, M5).** Logsources and rules for LLM gateways and MCP tool calls.
@@ -25,7 +25,7 @@ You need Rust 1.89 or newer (the minimum supported version). Install it with [ru
 ```bash
 git clone https://github.com/rifqifitriady/ZAAFElegia
 cd ZAAFElegia
-cargo install --path crates/zaaf-cli
+cargo install --locked --path crates/zaaf-cli
 ```
 
 ## Quick start
@@ -37,9 +37,11 @@ zaaf check path/to/sigma/rules
 # Hunt over NDJSON: a table on a terminal, OCSF NDJSON when piped
 zaaf hunt -r path/to/sigma/rules logs/*.ndjson
 
-# Stream from stdin and fail a CI job on any match
-tail -f app.ndjson | zaaf hunt -r rules/ --fail-on-match -
+# Read from stdin and fail a CI job on any match
+cat today.ndjson | zaaf hunt -r rules/ -o ndjson --fail-on-match -
 ```
+
+Table and json output appear at the end of the input; ndjson and csv stream as events arrive.
 
 `zaaf check` reports each diagnostic as `file:line:col: path: message` (prefixed with its
 severity, `error:` or `warning:`), where `path` is the location inside the rule's YAML.
@@ -81,8 +83,8 @@ The table shows the author but not the references, which are too long for it; us
 |---|---|
 | 0 | Success |
 | 1 | Matches found (only with `--fail-on-match`) |
-| 2 | Rule errors (with `--strict`), no rules left to run, or usage errors |
-| 3 | Input errors: an unreadable input file always; malformed records (including oversized lines) only with `--strict` or above `--max-errors` |
+| 2 | Usage errors. `zaaf check` exits 2 on any rule error; `zaaf hunt` exits 2 on rule errors only with `--strict`, and also when no rules are left to run |
+| 3 | Input errors: an unreadable input always (missing file, a directory, or a read error); malformed records (including oversized lines) only with `--strict` or above `--max-errors` |
 | 4 | Internal error |
 
 When several conditions hold, the highest-precedence code wins (4 > 3 > 2 > 1 > 0).
@@ -95,6 +97,10 @@ over 256 MiB are reported as input errors. An oversized NDJSON line counts as a 
 record, so it exits 3 only with `--strict` or above `--max-errors`. JSON arrays are buffered in memory in full, so
 prefer NDJSON for large inputs.
 
+`--from` and `--to` take RFC 3339 timestamps only (for example `2026-11-07T01:00:00Z`); anything
+else, such as a bare year, is a usage error. Events without a detectable timestamp pass the
+`--from`/`--to` filter, and their finding's `time` is the processing time.
+
 ## Limits
 
 To keep rules from exhausting memory or time, ZAAFElegia enforces these limits:
@@ -104,9 +110,14 @@ To keep rules from exhausting memory or time, ZAAFElegia enforces these limits:
 - Predicates per detection item: at most 16,384.
 - Per rule: at most 65,536 weight units (a regular expression counts as 16).
 - Per run: at most 1,000,000 weight units across all loaded rules.
+- Regular expressions: at most 1 MiB compiled size (program and lazy-DFA cache). A larger
+  pattern is a rule error naming the limit.
 - Regular expressions use a linear-time engine. Patterns it cannot run fall back to a
   backtracking engine capped at 1,000,000 steps. Hitting that cap counts as no match, and
   `zaaf hunt` prints a warning naming the rule.
+- `fieldref|contains` (and the other `fieldref` modes) compares every pair of values of the
+  two fields, so its cost grows with the square of the array sizes in the referenced fields.
+  Each event is bounded by the 8 MiB line cap; a per-event work budget is planned.
 
 ## Contributing
 
