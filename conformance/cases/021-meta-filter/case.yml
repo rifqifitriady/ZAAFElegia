@@ -1,0 +1,6 @@
+spec_ref: sigma-filters-specification.md
+description: A meta filter suppresses matches of the rules it lists (rule AND NOT filter).
+expected:
+  - [c021]
+  - []
+  - []

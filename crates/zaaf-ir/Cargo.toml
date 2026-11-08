@@ -1,0 +1,16 @@
+[package]
+name = "zaaf-ir"
+description = "Compiles Sigma rules into the ZAAFElegia intermediate representation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+fancy-regex.workspace = true
+ipnet.workspace = true
+regex.workspace = true
+zaaf-pipeline.workspace = true
+zaaf-sigma.workspace = true

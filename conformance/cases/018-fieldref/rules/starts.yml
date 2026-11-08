@@ -1,0 +1,7 @@
+title: fieldref startswith
+id: c018-starts
+logsource: {product: test}
+detection:
+    s:
+        Cmd2|fieldref|startswith: Head
+    condition: s

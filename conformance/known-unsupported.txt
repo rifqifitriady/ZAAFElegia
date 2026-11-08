@@ -1,0 +1,4 @@
+# SigmaHQ rule files ZAAFElegia knowingly rejects, one per line:
+#   <path relative to the SigmaHQ repo>  # <reason, with a spec reference>
+# A file is listed here only when rejecting it is correct per the Sigma 2.1
+# specification. Engine gaps are bugs and must be fixed instead.

@@ -1,0 +1,7 @@
+title: base64offset
+id: c016-off
+logsource: {product: test}
+detection:
+    s:
+        Payload|base64offset|contains: ping
+    condition: s

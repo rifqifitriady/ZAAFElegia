@@ -1,0 +1,7 @@
+title: rar
+id: c021
+logsource: {product: test}
+detection:
+    s:
+        Image|endswith: '\rar.exe'
+    condition: s

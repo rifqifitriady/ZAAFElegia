@@ -1,0 +1,7 @@
+title: night
+id: c022-night
+logsource: {product: test}
+detection:
+    s:
+        EventTime|hour|gte: 22
+    condition: s

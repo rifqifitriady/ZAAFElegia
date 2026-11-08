@@ -1,0 +1,7 @@
+title: array
+id: c023-arr
+logsource: {product: test}
+detection:
+    s:
+        Tags: malware
+    condition: s

@@ -1,0 +1,18 @@
+[package]
+name = "zaaf-eval"
+description = "Native Sigma evaluator, the semantic reference of ZAAFElegia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+zaaf-event.workspace = true
+zaaf-ir.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+zaaf-pipeline.workspace = true
+zaaf-sigma.workspace = true

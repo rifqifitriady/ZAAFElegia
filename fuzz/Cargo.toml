@@ -1,0 +1,39 @@
+[package]
+name = "zaaf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+zaaf-eval = { path = "../crates/zaaf-eval" }
+zaaf-event = { path = "../crates/zaaf-event" }
+zaaf-input = { path = "../crates/zaaf-input" }
+zaaf-ir = { path = "../crates/zaaf-ir" }
+zaaf-pipeline = { path = "../crates/zaaf-pipeline" }
+zaaf-sigma = { path = "../crates/zaaf-sigma" }
+
+[[bin]]
+name = "parse_rule"
+path = "fuzz_targets/parse_rule.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_ndjson"
+path = "fuzz_targets/read_ndjson.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "eval_event"
+path = "fuzz_targets/eval_event.rs"
+test = false
+doc = false
+bench = false

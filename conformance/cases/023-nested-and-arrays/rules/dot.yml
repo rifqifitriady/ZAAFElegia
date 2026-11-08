@@ -1,0 +1,7 @@
+title: nested
+id: c023-dot
+logsource: {product: test}
+detection:
+    s:
+        process.parent.name: explorer.exe
+    condition: s

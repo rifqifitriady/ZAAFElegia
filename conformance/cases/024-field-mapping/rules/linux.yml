@@ -1,0 +1,7 @@
+title: linux unmapped
+id: c024-linux
+logsource: {product: linux}
+detection:
+    s:
+        Image: /bin/sh
+    condition: s

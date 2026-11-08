@@ -1,0 +1,7 @@
+title: expand
+id: c019
+logsource: {product: test}
+detection:
+    s:
+        User|expand: '%Admins%'
+    condition: s

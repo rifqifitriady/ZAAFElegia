@@ -1,0 +1,6 @@
+spec_ref: sigma-appendix-modifiers.md#encoding (wide, utf16)
+description: '`wide|base64offset` finds UTF-16LE text inside base64 (e.g. PowerShell -enc); `utf16` prepends a BOM.'
+expected:
+  - [c017]
+  - []
+  - [c017-bom]

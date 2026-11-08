@@ -1,0 +1,20 @@
+[package]
+name = "zaaf-testkit"
+description = "Conformance and detection-as-code test harness for ZAAFElegia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde-saphyr.workspace = true
+zaaf-eval.workspace = true
+zaaf-input.workspace = true
+zaaf-ir.workspace = true
+zaaf-pipeline.workspace = true
+zaaf-sigma.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

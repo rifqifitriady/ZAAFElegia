@@ -1,0 +1,6 @@
+spec_ref: sigma-appendix-modifiers.md#numeric-modifiers
+description: Numeric comparisons accept JSON numbers and numeric strings (interpretation 12); a non-numeric string never matches; plain integers match their exact text.
+expected:
+  - [c011-eq, c011-gt]
+  - [c011-eq, c011-lte]
+  - []

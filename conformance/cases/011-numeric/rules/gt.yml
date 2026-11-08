@@ -1,0 +1,7 @@
+title: gt
+id: c011-gt
+logsource: {product: test}
+detection:
+    s:
+        Size|gt: 100
+    condition: s

@@ -1,0 +1,7 @@
+name: map-f
+transformations:
+  - type: field_name_mapping
+    mapping:
+      F: [a, b]
+    rule_conditions:
+      - product: test

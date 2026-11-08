@@ -1,0 +1,7 @@
+spec_ref: sigma-appendix-modifiers.md#specific-modifiers (fieldref)
+description: '`fieldref` compares two fields of the same event; the comparison is case-insensitive like every other string, and it combines with at most one of `contains`, `startswith` or `endswith`, and with `neq` (the neq rule requires a different value, and it is guarded by `Cmd2|exists: true`, so an event without `Cmd2` is not pinned by it). A `startswith`/`endswith` reference value that occurs only in the middle of the field does not match. A missing field never matches a positive `fieldref`.'
+expected:
+  - [c018-contains, c018-ends, c018-eq, c018-starts]
+  - [c018-neq]
+  - []
+  - [c018-eq]

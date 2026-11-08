@@ -1,0 +1,7 @@
+spec_ref: ZAAFElegia event model (interpretation 6)
+description: Dotted paths resolve exact keys first, then nested objects; arrays match if any element matches.
+expected:
+  - [c023-arr, c023-dot]
+  - [c023-dotkey]
+  - [c023-dot]
+  - [c023-dotkey]

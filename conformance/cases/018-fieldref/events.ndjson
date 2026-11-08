@@ -1,0 +1,4 @@
+{"TargetFilename": "C:\\a.exe", "Image": "c:\\A.exe", "CommandLine": "run as bob", "User": "BOB", "Cmd2": "run as bob", "Head": "RUN", "Tail": "BOB"}
+{"TargetFilename": "x", "Image": "y", "CommandLine": "z", "User": "q", "Cmd2": "z", "Head": "q", "Tail": "q"}
+{"TargetFilename": "x"}
+{"TargetFilename": "P", "Image": "p", "Cmd2": "run as bob", "Head": "AS", "Tail": "RUN"}

@@ -1,0 +1,3 @@
+{"process": {"executable": "C:\\Windows\\cmd.exe", "args": ["cmd", "/c", "whoami"]}}
+{"Image": "/bin/sh"}
+{"Image": "C:\\Windows\\cmd.exe", "CommandLine": "whoami"}

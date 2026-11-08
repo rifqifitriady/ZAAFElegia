@@ -1,0 +1,9 @@
+title: Filter admin accounts
+id: c021-filter
+logsource: {product: test}
+filter:
+    rules:
+        - c021
+    selection:
+        User|startswith: 'adm_'
+    condition: selection
