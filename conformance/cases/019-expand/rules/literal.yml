@@ -1,0 +1,7 @@
+title: literal percent
+id: c019-literal
+logsource: {product: test}
+detection:
+    s:
+        User: '%Admins%'
+    condition: s

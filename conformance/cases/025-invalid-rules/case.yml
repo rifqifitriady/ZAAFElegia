@@ -1,0 +1,5 @@
+spec_ref: sigma-rules-specification.md; sigma-appendix-modifiers.md
+description: Invalid rules are rejected one error each, and do not stop valid rules from running.
+compile_errors: 7
+expected:
+  - [c025-good]

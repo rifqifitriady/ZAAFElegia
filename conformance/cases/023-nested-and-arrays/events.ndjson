@@ -1,0 +1,4 @@
+{"process": {"parent": {"name": "EXPLORER.EXE"}}, "Tags": ["benign", "Malware"]}
+{"user.name": "alice"}
+{"process": [{"parent": {"name": "x"}}, {"parent": {"name": "explorer.exe"}}]}
+{"user": {"name": "alice"}}

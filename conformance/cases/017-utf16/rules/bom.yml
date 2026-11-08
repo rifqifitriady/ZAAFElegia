@@ -1,0 +1,7 @@
+title: utf16 with BOM
+id: c017-bom
+logsource: {product: test}
+detection:
+    s:
+        Data|utf16|base64: ab
+    condition: s

@@ -1,0 +1,6 @@
+spec_ref: sigma-appendix-modifiers.md#numeric-modifiers
+description: Numeric comparisons accept numbers and numeric strings; plain integers match their exact text.
+expected:
+  - [c011-eq, c011-gt]
+  - [c011-eq, c011-lte]
+  - []

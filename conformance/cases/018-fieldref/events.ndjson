@@ -1,0 +1,3 @@
+{"TargetFilename": "C:\\a.exe", "Image": "c:\\A.exe", "CommandLine": "run as bob", "User": "BOB"}
+{"TargetFilename": "x", "Image": "y", "CommandLine": "z", "User": "q"}
+{"TargetFilename": "x"}

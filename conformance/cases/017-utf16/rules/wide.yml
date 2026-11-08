@@ -1,0 +1,7 @@
+title: wide base64offset
+id: c017
+logsource: {product: test}
+detection:
+    s:
+        CommandLine|wide|base64offset|contains: cmd
+    condition: s

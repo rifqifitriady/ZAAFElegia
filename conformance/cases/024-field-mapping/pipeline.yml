@@ -1,0 +1,8 @@
+name: ecs-test
+transformations:
+  - type: field_name_mapping
+    mapping:
+      Image: process.executable
+      CommandLine: [process.command_line, process.args]
+    rule_conditions:
+      - product: windows

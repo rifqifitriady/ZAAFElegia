@@ -1,0 +1,7 @@
+title: fieldref contains
+id: c018-contains
+logsource: {product: test}
+detection:
+    s:
+        CommandLine|fieldref|contains: User
+    condition: s

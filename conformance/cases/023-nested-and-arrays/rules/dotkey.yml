@@ -1,0 +1,7 @@
+title: dotted key
+id: c023-dotkey
+logsource: {product: test}
+detection:
+    s:
+        user.name: alice
+    condition: s

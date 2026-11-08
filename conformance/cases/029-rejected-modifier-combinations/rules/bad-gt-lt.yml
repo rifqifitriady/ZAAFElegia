@@ -1,0 +1,7 @@
+title: bad-gt-lt
+id: c029-1
+logsource: {product: test}
+detection:
+    selection:
+        C|gt|lt: 5
+    condition: selection

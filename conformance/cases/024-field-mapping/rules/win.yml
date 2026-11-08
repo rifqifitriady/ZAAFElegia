@@ -1,0 +1,8 @@
+title: windows mapped
+id: c024-win
+logsource: {product: windows}
+detection:
+    s:
+        Image|endswith: '\cmd.exe'
+        CommandLine|contains: whoami
+    condition: s

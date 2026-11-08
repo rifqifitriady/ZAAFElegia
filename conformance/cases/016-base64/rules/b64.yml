@@ -1,0 +1,7 @@
+title: base64
+id: c016-b64
+logsource: {product: test}
+detection:
+    s:
+        Payload|base64|contains: whoami
+    condition: s

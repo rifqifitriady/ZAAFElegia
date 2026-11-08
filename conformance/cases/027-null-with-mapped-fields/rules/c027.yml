@@ -1,0 +1,9 @@
+title: null with mapped fields
+id: c027
+logsource: {product: test}
+detection:
+    selection:
+        X: 1
+    filter:
+        F: null
+    condition: selection and not filter

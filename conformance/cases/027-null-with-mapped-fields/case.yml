@@ -1,0 +1,8 @@
+spec_ref: sigma-rules-specification.md#special-field-values; ZAAFElegia pipelines (field_name_mapping)
+description: '`null` on a field mapped to several names is true only if every mapped alternative is absent or JSON null (interpretation 8, mirrors `exists`); the rule therefore matches when any alternative holds a value.'
+pipelines: [pipeline.yml]
+expected:
+  - []
+  - [c027]
+  - []
+  - [c027]

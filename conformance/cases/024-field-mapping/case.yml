@@ -1,0 +1,7 @@
+spec_ref: ZAAFElegia pipelines (field_name_mapping)
+description: Mapped fields are looked up under their new names (one-to-many is OR); rule_conditions limit a mapping to matching logsources.
+pipelines: [pipeline.yml]
+expected:
+  - [c024-win]
+  - [c024-linux]
+  - []

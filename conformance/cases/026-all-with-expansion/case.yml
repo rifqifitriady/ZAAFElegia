@@ -1,0 +1,6 @@
+spec_ref: sigma-appendix-modifiers.md#generic-modifiers (all), #string-modifiers (windash)
+description: With `all` and an expanding modifier (`windash`, `base64offset`, `expand`) the original values are AND-ed and each value's expansion variants are OR-ed (pySigma semantics, interpretation 7). Here ` -a` may appear as ` /a` or with an en dash, but both values must be present.
+expected:
+  - [c026]
+  - []
+  - [c026]
