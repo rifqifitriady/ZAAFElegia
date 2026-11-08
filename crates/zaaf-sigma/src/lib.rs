@@ -2,10 +2,12 @@
 
 pub mod diagnostic;
 pub mod modifier;
+pub mod sigma_string;
 pub mod value;
 
 pub use diagnostic::{Diagnostic, Location, Severity};
 pub use modifier::{FieldKey, Modifier, parse_field_key};
+pub use sigma_string::{SigmaString, Tok};
 pub use value::RuleValue;
 
 /// Version of the Sigma specification this crate implements.
