@@ -82,6 +82,14 @@ fn empty_rules_directory_is_reported() {
         !result.passed(),
         "a case with no rules must not pass vacuously"
     );
+    assert!(
+        result
+            .failures
+            .iter()
+            .any(|f| f.contains("rules/ contains no rule documents")),
+        "{:?}",
+        result.failures
+    );
 }
 
 #[test]
@@ -97,6 +105,14 @@ fn empty_expected_is_reported() {
     assert!(
         !result.passed(),
         "an empty expected list must not pass vacuously"
+    );
+    assert!(
+        result
+            .failures
+            .iter()
+            .any(|f| f.contains("`expected` must list at least one event")),
+        "{:?}",
+        result.failures
     );
 }
 
