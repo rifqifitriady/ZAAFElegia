@@ -2,6 +2,8 @@
 
 mod check;
 mod exit;
+mod hunt;
+mod output;
 mod rules;
 
 use clap::{Parser, Subcommand};
@@ -23,6 +25,8 @@ struct Cli {
 enum Command {
     /// Parse, compile and lint Sigma rules
     Check(check::CheckArgs),
+    /// Run Sigma rules over log events and emit OCSF Detection Findings
+    Hunt(hunt::HuntArgs),
 }
 
 fn main() -> ExitCode {
@@ -35,6 +39,7 @@ fn main() -> ExitCode {
         }
         match cli.command {
             Command::Check(args) => check::run(args),
+            Command::Hunt(args) => hunt::run(args),
         }
     }))
     .unwrap_or(exit::INTERNAL);
