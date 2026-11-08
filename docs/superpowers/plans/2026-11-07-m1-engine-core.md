@@ -14,8 +14,8 @@
 - `zaaf-testkit` runs the language-neutral conformance suite.
 
 **Tech Stack:**
-- Rust (edition 2024, MSRV 1.85).
-- Libraries: serde, serde_yaml_ng, serde_json, regex, fancy-regex, base64, ipnet, chrono, clap, comfy-table, walkdir.
+- Rust (edition 2024, MSRV 1.89).
+- Libraries: serde, saphyr, serde-saphyr, serde_json, regex, fancy-regex, base64, ipnet, chrono, clap, comfy-table, walkdir.
 - Tests: assert_cmd/predicates/tempfile, cargo-fuzz.
 - Supply chain: cargo-deny.
 
@@ -25,7 +25,7 @@
 
 - **License:** Apache-2.0. `cargo-deny` must reject AGPL, GPL, SSPL, Elastic License and unlicensed dependencies.
 - **No copied code:** nothing is copied from Hayabusa, Chainsaw, Velociraptor, Security Onion, elastic/detection-rules or any copyleft or source-available project.
-- **Toolchain:** Rust stable, `edition = "2024"`, `rust-version = "1.85"`.
+- **Toolchain:** Rust stable, `edition = "2024"`, `rust-version = "1.89"` (the floor set by `serde-saphyr` 2.1; `comfy-table` 8.0 already needs 1.88). Rust 1.88+ has `let` chains, so clippy's `collapsible_if` expects them; the code below uses them.
 - **Names:** crates are `zaaf-*`; the binary is `zaaf`.
 - **Sigma version:** Sigma specification 2.1.0, covering rules, the modifiers appendix and filters.
 - **Semantic reference:** `zaaf-eval` defines the semantics. Every interpretation of an ambiguous spec point is recorded in a conformance case's `spec_ref` and `description`.
@@ -48,7 +48,6 @@
 ## Scope notes for M1 (agreed narrowing of the spec)
 
 - **Correlation documents** are parsed as stubs and skipped with a warning. The correlator is M2.
-- **Diagnostics location:** YAML syntax errors report `file:line:col`. Semantic errors report the file plus a YAML path such as `detection.selection.Image|bogus`. The YAML library does not expose spans for values.
 - **Deferred `zaaf check` lints:** the ATT&CK/ATLAS tag existence lint needs bundled STIX data and moves to M5 with `coverage`. The correlation-reference lint moves to M2.
 - **Input formats:** NDJSON or a top-level JSON array. CloudTrail `Records[]`, EVTX and Parquet are M3/M4.
 - **Rule selection:** every rule runs against every event. Indexing rules by logsource needs typed inputs (M3).
@@ -119,7 +118,7 @@ source "$HOME/.cargo/env"
 cargo --version && rustc --version
 cargo install cargo-deny --locked
 ```
-Expected: `cargo 1.x` and `rustc 1.x` with x ≥ 85, and `cargo deny --version` prints a version.
+Expected: `cargo 1.x` and `rustc 1.x` with x ≥ 89, and `cargo deny --version` prints a version.
 
 - [ ] **Step 2: Write the workspace files**
 
@@ -142,7 +141,7 @@ version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rifqifitriady/ZAAFElegia"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -154,9 +153,10 @@ fancy-regex = "0.20"
 indexmap = { version = "2.14", features = ["serde"] }
 ipnet = "2.12"
 regex = "1.13"
+saphyr = "0.3"
 serde = { version = "1.0", features = ["derive"] }
+serde-saphyr = "2.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
-serde_yaml_ng = "0.10"
 walkdir = "2.5"
 assert_cmd = "2.2"
 predicates = "3.1"
@@ -173,6 +173,8 @@ zaaf-testkit = { path = "crates/zaaf-testkit", version = "0.0.1" }
 lto = "thin"
 codegen-units = 1
 ```
+
+YAML is read with two pure-Rust crates: `saphyr` parses Sigma rule files into nodes that carry their line and column, and `serde-saphyr` (`#![forbid(unsafe_code)]`) deserializes the serde-derived config files (pipelines, conformance `case.yml`). `serde_yaml_ng` is deliberately not used: it depends on `unsafe-libyaml`, which is unmaintained (RUSTSEC-2024-0449).
 
 `.gitignore`:
 ```
@@ -283,8 +285,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-serde.workspace = true
-serde_yaml_ng.workspace = true
+saphyr.workspace = true
 ```
 
 `crates/zaaf-sigma/src/lib.rs`:
@@ -341,10 +342,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
     - `.with_file(impl Into<PathBuf>)`
     - `.is_error()`
     - `Display`
-  - `Location::{Unknown, LineCol{line,col}, Path{doc,path}}`
+  - `Location::{Unknown, At { line, col, path }}`: 1-based line and column plus the dotted YAML path of the node (empty when no path applies)
+    - `Location::at(line, col, impl Into<String>)`
   - `Severity::{Error, Warning}`
   - `RuleValue::{Str(String), Int(i64), Float(f64), Bool(bool), Null}`
-    - `RuleValue::from_yaml(&serde_yaml_ng::Value) -> Option<RuleValue>`
+    - `RuleValue::from_yaml(&saphyr::MarkedYaml) -> Option<RuleValue>`: `None` for sequences, mappings, tagged values, aliases and bad values
     - `RuleValue::to_text(&self) -> Option<String>`
   - `Modifier` (one variant per Sigma 2.1 modifier)
     - `Modifier::parse(&str) -> Option<Modifier>`
@@ -362,17 +364,15 @@ mod tests {
 
     #[test]
     fn displays_line_and_column() {
-        let d = Diagnostic::error(Location::LineCol { line: 3, col: 7 }, "bad").with_file("r.yml");
+        let d = Diagnostic::error(Location::at(3, 7, ""), "bad").with_file("r.yml");
         assert_eq!(d.to_string(), "error: r.yml:3:7: bad");
     }
 
     #[test]
-    fn displays_yaml_path() {
-        let d = Diagnostic::warning(
-            Location::Path { doc: 0, path: "detection.sel.Image".into() },
-            "unmapped",
-        );
-        assert_eq!(d.to_string(), "warning: <input> [doc 0] detection.sel.Image: unmapped");
+    fn displays_position_and_yaml_path() {
+        let d = Diagnostic::warning(Location::at(12, 9, "detection.sel.Image"), "unmapped");
+        assert_eq!(d.to_string(), "warning: <input>:12:9: detection.sel.Image: unmapped");
+        assert_eq!(d.location, Location::At { line: 12, col: 9, path: "detection.sel.Image".into() });
     }
 
     #[test]
@@ -389,18 +389,20 @@ mod tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saphyr::LoadableYamlNode;
 
     #[test]
     fn converts_yaml_scalars() {
-        let y: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str("[abc, 4688, 1.5, true, null, [x]]").unwrap();
-        let s = y.as_sequence().unwrap();
+        let docs = MarkedYaml::load_from_str("[abc, 4688, 1.5, true, null, '4688', [x], !custom y]").unwrap();
+        let s = docs[0].data.as_vec().unwrap();
         assert_eq!(RuleValue::from_yaml(&s[0]), Some(RuleValue::Str("abc".into())));
         assert_eq!(RuleValue::from_yaml(&s[1]), Some(RuleValue::Int(4688)));
         assert_eq!(RuleValue::from_yaml(&s[2]), Some(RuleValue::Float(1.5)));
         assert_eq!(RuleValue::from_yaml(&s[3]), Some(RuleValue::Bool(true)));
         assert_eq!(RuleValue::from_yaml(&s[4]), Some(RuleValue::Null));
-        assert_eq!(RuleValue::from_yaml(&s[5]), None);
+        assert_eq!(RuleValue::from_yaml(&s[5]), Some(RuleValue::Str("4688".into())));
+        assert_eq!(RuleValue::from_yaml(&s[6]), None);
+        assert_eq!(RuleValue::from_yaml(&s[7]), None);
     }
 
     #[test]
@@ -495,15 +497,20 @@ pub enum Severity {
     Warning,
 }
 
-/// Where in a rule file a diagnostic points.
+/// Where in a file a diagnostic points.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     Unknown,
-    /// 1-based line and column (YAML syntax errors).
-    LineCol { line: usize, col: usize },
-    /// Document index in a multi-document file plus a dotted YAML path,
-    /// e.g. `detection.selection.Image|endswith`.
-    Path { doc: usize, path: String },
+    /// 1-based line and column, plus the dotted YAML path of the node
+    /// (e.g. `detection.selection.Image|endswith`). `path` is empty when no
+    /// path applies, e.g. for YAML syntax errors or a whole document.
+    At { line: usize, col: usize, path: String },
+}
+
+impl Location {
+    pub fn at(line: usize, col: usize, path: impl Into<String>) -> Self {
+        Self::At { line, col, path: path.into() }
+    }
 }
 
 /// A problem found in a rule, pipeline or input file.
@@ -547,8 +554,10 @@ impl fmt::Display for Diagnostic {
             .unwrap_or_else(|| "<input>".to_string());
         match &self.location {
             Location::Unknown => write!(f, "{sev}: {file}: {}", self.message),
-            Location::LineCol { line, col } => write!(f, "{sev}: {file}:{line}:{col}: {}", self.message),
-            Location::Path { doc, path } => write!(f, "{sev}: {file} [doc {doc}] {path}: {}", self.message),
+            Location::At { line, col, path } if path.is_empty() => {
+                write!(f, "{sev}: {file}:{line}:{col}: {}", self.message)
+            }
+            Location::At { line, col, path } => write!(f, "{sev}: {file}:{line}:{col}: {path}: {}", self.message),
         }
     }
 }
@@ -557,6 +566,8 @@ impl fmt::Display for Diagnostic {
 Insert above the tests of `value.rs`:
 ```rust
 //! Scalar values as written in a Sigma detection.
+
+use saphyr::{MarkedYaml, Scalar, YamlData};
 
 /// A scalar value from a Sigma detection.
 #[derive(Debug, Clone, PartialEq)]
@@ -569,14 +580,15 @@ pub enum RuleValue {
 }
 
 impl RuleValue {
-    /// Converts a YAML scalar. Returns `None` for sequences, mappings and tagged values.
-    pub fn from_yaml(v: &serde_yaml_ng::Value) -> Option<Self> {
-        use serde_yaml_ng::Value as Y;
-        match v {
-            Y::Null => Some(Self::Null),
-            Y::Bool(b) => Some(Self::Bool(*b)),
-            Y::Number(n) => n.as_i64().map(Self::Int).or_else(|| n.as_f64().map(Self::Float)),
-            Y::String(s) => Some(Self::Str(s.clone())),
+    /// Converts a YAML scalar. Returns `None` for sequences, mappings, tagged
+    /// values, aliases and invalid values.
+    pub fn from_yaml(v: &MarkedYaml<'_>) -> Option<Self> {
+        match &v.data {
+            YamlData::Value(Scalar::Null) => Some(Self::Null),
+            YamlData::Value(Scalar::Boolean(b)) => Some(Self::Bool(*b)),
+            YamlData::Value(Scalar::Integer(i)) => Some(Self::Int(*i)),
+            YamlData::Value(Scalar::FloatingPoint(f)) => Some(Self::Float(f.into_inner())),
+            YamlData::Value(Scalar::String(s)) => Some(Self::Str(s.to_string())),
             _ => None,
         }
     }
@@ -1311,17 +1323,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Consumes: `parse_field_key`, `RuleValue::from_yaml`, `parse_condition`, `Diagnostic` (Tasks 1–3).
 - Produces:
   - `LogSource { category, product, service: Option<String> }`
-  - `FieldItem { field: Option<String>, modifiers: Vec<Modifier>, values: Vec<RuleValue>, path: String }`
+  - `FieldItem { field: Option<String>, modifiers: Vec<Modifier>, values: Vec<RuleValue>, path: String, line: usize, col: usize }`. `line`/`col` are the 1-based position of the item's key (of the search identifier's key for keyword lists).
   - `SearchIdentifier { name: String, alternatives: Vec<Vec<FieldItem>> }`. Alternatives are OR'd; the items inside one alternative are AND'd.
-  - `Detection { search_ids: Vec<SearchIdentifier>, conditions: Vec<CondExpr> }`. Multiple conditions are OR'd.
+  - `Detection { search_ids: Vec<SearchIdentifier>, conditions: Vec<CondExpr>, condition_line: usize, condition_col: usize }`. Multiple conditions are OR'd; `condition_line`/`condition_col` are the 1-based position of the `condition` value.
   - `RuleMeta { title, id, name, status, level, description, author, references, tags, falsepositives, date, modified }`
-  - `Rule { meta, logsource, detection }`
-  - `Filter { title, id, name, logsource, rules: Vec<String>, detection }`
-  - `CorrelationStub { title, id }`
+  - `Rule { meta, logsource, detection, line, col }`
+  - `Filter { title, id, name, logsource, rules: Vec<String>, detection, line, col }`
+  - `CorrelationStub { title, id, line, col }`
+  - `Rule`, `Filter` and `CorrelationStub` `line`/`col`: 1-based start of the document (its first key).
   - `Document::{Rule, Filter, Correlation}`
   - `ParsedFile { documents: Vec<Document>, diagnostics: Vec<Diagnostic> }`
   - `parse_str(&str) -> ParsedFile`
   - `parse_file(&Path) -> ParsedFile`. Every diagnostic carries the file.
+- Every parse diagnostic is `Location::At` with the offending node's position and YAML path. Invalid YAML (a syntax error or a duplicated key) rejects the whole file: `saphyr` fails the entire stream, so `parse_str` returns no documents and one `Location::At` diagnostic with an empty path.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1412,6 +1426,17 @@ level: low
         assert_eq!(item.modifiers, vec![Modifier::EndsWith]);
         assert_eq!(item.values, vec![RuleValue::Str(r"\QuickAssist.exe".into())]);
         assert_eq!(item.path, "detection.selection.Image|endswith");
+        assert_eq!((item.line, item.col), (18, 9));
+        assert_eq!((r.detection.condition_line, r.detection.condition_col), (19, 16));
+        assert_eq!((r.line, r.col), (2, 1));
+    }
+
+    #[test]
+    fn quoted_numbers_stay_strings() {
+        let r = only_rule(&rule_with("    s:\n        EventID: '4688'\n        Other: 4688\n    condition: s\n"));
+        let items = &r.detection.search_ids[0].alternatives[0];
+        assert_eq!(items[0].values, vec![RuleValue::Str("4688".into())]);
+        assert_eq!(items[1].values, vec![RuleValue::Int(4688)]);
     }
 
     #[test]
@@ -1423,6 +1448,7 @@ level: low
         assert_eq!(alts.len(), 2);
         assert_eq!(alts[1].len(), 2);
         assert_eq!(alts[1][0].path, "detection.selection[1].B");
+        assert_eq!((alts[1][0].line, alts[1][0].col), (8, 11));
     }
 
     #[test]
@@ -1433,6 +1459,7 @@ level: low
         let kw = &r.detection.search_ids[0].alternatives[0][0];
         assert_eq!(kw.field, None);
         assert_eq!(kw.values.len(), 2);
+        assert_eq!((kw.line, kw.col), (6, 5));
         let all = &r.detection.search_ids[1].alternatives[0][0];
         assert_eq!(all.field, None);
         assert_eq!(all.modifiers, vec![Modifier::All]);
@@ -1461,6 +1488,7 @@ level: low
         assert_eq!(f.rules, vec!["6f3e2987-db24-4c78-a860-b4f4095a7095"]);
         assert_eq!(f.detection.search_ids.len(), 1);
         assert_eq!(f.detection.search_ids[0].name, "selection");
+        assert_eq!((f.line, f.col), (1, 1));
     }
 
     #[test]
@@ -1472,21 +1500,30 @@ level: low
         let parsed = parse_str(&src);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         assert_eq!(parsed.documents.len(), 2);
-        assert!(matches!(parsed.documents[1], Document::Correlation(_)));
+        let Document::Correlation(c) = &parsed.documents[1] else { panic!("{:?}", parsed.documents[1]) };
+        assert_eq!((c.line, c.col), (10, 1));
     }
 
     #[test]
-    fn reports_errors_with_yaml_paths() {
+    fn reports_errors_with_positions_and_yaml_paths() {
         let parsed = parse_str(&rule_with(
             "    sel:\n        A|bogus: 1\n        B:\n            - ''\n            - null\n    condition: sel\n",
         ));
         let msgs: Vec<String> = parsed.diagnostics.iter().map(|d| d.to_string()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("detection.sel.A|bogus") && m.contains("unknown modifier")),
+            msgs.iter().any(|m| m.contains("<input>:7:9: detection.sel.A|bogus: unknown modifier")),
             "{msgs:?}"
         );
-        assert!(msgs.iter().any(|m| m.contains("detection.sel.B") && m.contains("null")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("<input>:10:15: detection.sel.B: `null`")), "{msgs:?}");
         assert!(parsed.documents.is_empty());
+    }
+
+    #[test]
+    fn semantic_error_reports_the_right_line() {
+        let parsed = parse_str(&rule_with("    sel:\n        A: 1\n    condition: sel and\n"));
+        assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.diagnostics[0].location, Location::at(8, 16, "detection.condition"));
+        assert!(parsed.diagnostics[0].message.contains("invalid condition"));
     }
 
     #[test]
@@ -1495,14 +1532,24 @@ level: low
         let all = p.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>().join("\n");
         assert!(all.contains("title"), "{all}");
         assert!(all.contains("correlation rule"), "{all}");
-        let p = parse_str("action: global\ntitle: x\n");
+        let p = parse_str("title: x\naction: global\n");
         assert!(p.diagnostics[0].message.contains("action"));
+        assert_eq!(p.diagnostics[0].location, Location::at(2, 1, "action"));
     }
 
     #[test]
     fn yaml_syntax_error_has_line_and_column() {
         let p = parse_str("title: x\ndetection: [unclosed\n");
-        assert!(matches!(p.diagnostics[0].location, Location::LineCol { .. }), "{:?}", p.diagnostics);
+        assert_eq!(p.diagnostics[0].location, Location::at(3, 1, ""), "{:?}", p.diagnostics);
+        assert!(p.diagnostics[0].message.starts_with("invalid YAML"), "{:?}", p.diagnostics);
+    }
+
+    #[test]
+    fn duplicate_key_is_an_error() {
+        let p = parse_str("title: a\ntitle: b\nlogsource: {product: x}\ndetection: {s: {A: 1}, condition: s}\n");
+        assert!(p.documents.is_empty());
+        assert_eq!(p.diagnostics[0].location, Location::at(2, 1, ""), "{:?}", p.diagnostics);
+        assert!(p.diagnostics[0].message.contains("duplicated key"), "{:?}", p.diagnostics);
     }
 
     #[test]
@@ -1527,9 +1574,11 @@ use crate::condition::{CondExpr, parse_condition};
 use crate::diagnostic::{Diagnostic, Location};
 use crate::modifier::{Modifier, parse_field_key};
 use crate::value::RuleValue;
-use serde::Deserialize;
-use serde_yaml_ng::{Mapping, Value};
+use saphyr::{AnnotatedMapping, LoadableYamlNode, MarkedYaml, Scalar, YamlData};
 use std::path::Path;
+
+type Node<'a> = MarkedYaml<'a>;
+type Map<'a> = AnnotatedMapping<'a, MarkedYaml<'a>>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogSource {
@@ -1546,6 +1595,9 @@ pub struct FieldItem {
     pub values: Vec<RuleValue>,
     /// YAML path used in diagnostics, e.g. `detection.selection.Image|endswith`.
     pub path: String,
+    /// 1-based position of the item's key (of the search identifier for keyword lists).
+    pub line: usize,
+    pub col: usize,
 }
 
 /// A named search identifier. Alternatives are OR'd; items in one alternative are AND'd.
@@ -1560,6 +1612,9 @@ pub struct Detection {
     pub search_ids: Vec<SearchIdentifier>,
     /// Several conditions are OR'd.
     pub conditions: Vec<CondExpr>,
+    /// 1-based position of the `condition` value.
+    pub condition_line: usize,
+    pub condition_col: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1583,6 +1638,9 @@ pub struct Rule {
     pub meta: RuleMeta,
     pub logsource: LogSource,
     pub detection: Detection,
+    /// 1-based position where the document starts (its first key).
+    pub line: usize,
+    pub col: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1594,6 +1652,9 @@ pub struct Filter {
     /// Ids or names of the rules the filter applies to.
     pub rules: Vec<String>,
     pub detection: Detection,
+    /// 1-based position where the document starts (its first key).
+    pub line: usize,
+    pub col: usize,
 }
 
 /// Placeholder until correlation rules are implemented (milestone M2).
@@ -1601,6 +1662,9 @@ pub struct Filter {
 pub struct CorrelationStub {
     pub title: String,
     pub id: Option<String>,
+    /// 1-based position where the document starts (its first key).
+    pub line: usize,
+    pub col: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1618,30 +1682,45 @@ pub struct ParsedFile {
 
 type Diags = Vec<Diagnostic>;
 
-fn path_err(doc: usize, path: &str, msg: impl Into<String>) -> Diagnostic {
-    Diagnostic::error(Location::Path { doc, path: path.to_string() }, msg)
+/// 1-based line and column where `node` starts.
+fn line_col(node: &Node) -> (usize, usize) {
+    (node.span.start.line(), node.span.start.col() + 1)
+}
+
+fn err(node: &Node, path: &str, msg: impl Into<String>) -> Diagnostic {
+    let (line, col) = line_col(node);
+    Diagnostic::error(Location::at(line, col, path), msg)
+}
+
+/// The key and value nodes of `key` in a mapping.
+fn entry<'n, 'a>(map: &'n Map<'a>, key: &str) -> Option<(&'n Node<'a>, &'n Node<'a>)> {
+    map.iter().find(|(k, _)| k.data.as_str() == Some(key))
+}
+
+fn get<'n, 'a>(map: &'n Map<'a>, key: &str) -> Option<&'n Node<'a>> {
+    entry(map, key).map(|(_, v)| v)
 }
 
 /// Parses a (possibly multi-document) Sigma YAML string.
 pub fn parse_str(src: &str) -> ParsedFile {
     let mut out = ParsedFile::default();
-    for (idx, de) in serde_yaml_ng::Deserializer::from_str(src).enumerate() {
-        let value = match Value::deserialize(de) {
-            Ok(v) => v,
-            Err(e) => {
-                let loc = e
-                    .location()
-                    .map(|l| Location::LineCol { line: l.line(), col: l.column() })
-                    .unwrap_or(Location::Unknown);
-                out.diagnostics.push(Diagnostic::error(loc, format!("YAML syntax error: {e}")));
-                break;
-            }
-        };
-        if value.is_null() {
+    let docs = match MarkedYaml::load_from_str(src) {
+        Ok(docs) => docs,
+        Err(e) => {
+            let m = e.marker();
+            out.diagnostics.push(Diagnostic::error(
+                Location::at(m.line(), m.col() + 1, ""),
+                format!("invalid YAML: {}", e.info()),
+            ));
+            return out;
+        }
+    };
+    for doc in &docs {
+        if doc.data.is_null() {
             continue;
         }
-        match parse_document(idx, &value) {
-            Ok(doc) => out.documents.push(doc),
+        match parse_document(doc) {
+            Ok(d) => out.documents.push(d),
             Err(mut d) => out.diagnostics.append(&mut d),
         }
     }
@@ -1663,78 +1742,86 @@ pub fn parse_file(path: &Path) -> ParsedFile {
     parsed
 }
 
-fn parse_document(doc: usize, v: &Value) -> Result<Document, Diags> {
-    let Some(map) = v.as_mapping() else {
-        return Err(vec![path_err(doc, "", "document is not a YAML mapping")]);
+fn parse_document(doc: &Node) -> Result<Document, Diags> {
+    let YamlData::Mapping(map) = &doc.data else {
+        return Err(vec![err(doc, "", "document is not a YAML mapping")]);
     };
-    if map.contains_key("action") {
-        return Err(vec![path_err(
-            doc,
+    if let Some((key, _)) = entry(map, "action") {
+        return Err(vec![err(
+            key,
             "action",
             "Sigma 1.x collection actions (`action: global|reset|repeat`) are not supported; \
              split the collection into standalone rules",
         )]);
     }
-    if map.contains_key("correlation") {
+    let (line, col) = line_col(doc);
+    let has = |key: &str| entry(map, key).is_some();
+    if has("correlation") {
         return Ok(Document::Correlation(CorrelationStub {
             title: get_str(map, "title").unwrap_or_default(),
             id: get_str(map, "id"),
+            line,
+            col,
         }));
     }
-    if map.contains_key("filter") && !map.contains_key("detection") {
+    if has("filter") && !has("detection") {
         return parse_filter(doc, map).map(Document::Filter);
     }
-    if map.contains_key("detection") {
+    if has("detection") {
         return parse_rule(doc, map).map(Document::Rule);
     }
-    Err(vec![path_err(
+    Err(vec![err(
         doc,
         "",
         "document is not a Sigma rule, filter or correlation (no `detection`, `filter` or `correlation` key)",
     )])
 }
 
-fn get_str(map: &Mapping, key: &str) -> Option<String> {
-    match map.get(key)? {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
+fn get_str(map: &Map, key: &str) -> Option<String> {
+    match &get(map, key)?.data {
+        YamlData::Value(Scalar::String(s)) => Some(s.to_string()),
+        YamlData::Value(Scalar::Integer(i)) => Some(i.to_string()),
+        YamlData::Value(Scalar::FloatingPoint(f)) => Some(f.into_inner().to_string()),
         _ => None,
     }
 }
 
-fn get_str_list(map: &Mapping, key: &str) -> Vec<String> {
-    match map.get(key) {
-        Some(Value::Sequence(seq)) => seq.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        Some(Value::String(s)) => vec![s.clone()],
+fn get_str_list(map: &Map, key: &str) -> Vec<String> {
+    match get(map, key).map(|n| &n.data) {
+        Some(YamlData::Sequence(seq)) => seq.iter().filter_map(|v| v.data.as_str().map(str::to_string)).collect(),
+        Some(YamlData::Value(Scalar::String(s))) => vec![s.to_string()],
         _ => Vec::new(),
     }
 }
 
-fn parse_logsource(doc: usize, map: &Mapping) -> Result<LogSource, Diags> {
-    match map.get("logsource").and_then(Value::as_mapping) {
-        Some(ls) => Ok(LogSource {
+fn parse_logsource(doc: &Node, map: &Map) -> Result<LogSource, Diags> {
+    match entry(map, "logsource") {
+        Some((_, Node { data: YamlData::Mapping(ls), .. })) => Ok(LogSource {
             category: get_str(ls, "category"),
             product: get_str(ls, "product"),
             service: get_str(ls, "service"),
         }),
-        None => Err(vec![path_err(doc, "logsource", "missing mandatory `logsource` mapping")]),
+        other => Err(vec![err(other.map_or(doc, |(_, v)| v), "logsource", "missing mandatory `logsource` mapping")]),
     }
 }
 
-fn parse_rule(doc: usize, map: &Mapping) -> Result<Rule, Diags> {
+fn parse_rule(doc: &Node, map: &Map) -> Result<Rule, Diags> {
     let mut diags = Vec::new();
     let title = get_str(map, "title");
     if title.is_none() {
-        diags.push(path_err(doc, "title", "missing mandatory `title`"));
+        diags.push(err(doc, "title", "missing mandatory `title`"));
     }
     let logsource = parse_logsource(doc, map).map_err(|mut d| diags.append(&mut d)).ok();
-    let detection = match map.get("detection").and_then(Value::as_mapping) {
-        Some(dm) => parse_detection(doc, "detection", dm, &[]).map_err(|mut d| diags.append(&mut d)).ok(),
-        None => {
-            diags.push(path_err(doc, "detection", "`detection` must be a mapping"));
+    let detection = match entry(map, "detection") {
+        Some((key, Node { data: YamlData::Mapping(dm), .. })) => {
+            parse_detection("detection", key, dm, &[]).map_err(|mut d| diags.append(&mut d)).ok()
+        }
+        other => {
+            diags.push(err(other.map_or(doc, |(_, v)| v), "detection", "`detection` must be a mapping"));
             None
         }
     };
+    let (line, col) = line_col(doc);
     match (title, logsource, detection) {
         (Some(title), Some(logsource), Some(detection)) if diags.is_empty() => Ok(Rule {
             meta: RuleMeta {
@@ -1753,32 +1840,36 @@ fn parse_rule(doc: usize, map: &Mapping) -> Result<Rule, Diags> {
             },
             logsource,
             detection,
+            line,
+            col,
         }),
         _ => Err(diags),
     }
 }
 
-fn parse_filter(doc: usize, map: &Mapping) -> Result<Filter, Diags> {
+fn parse_filter(doc: &Node, map: &Map) -> Result<Filter, Diags> {
     let mut diags = Vec::new();
     let title = get_str(map, "title");
     if title.is_none() {
-        diags.push(path_err(doc, "title", "missing mandatory `title`"));
+        diags.push(err(doc, "title", "missing mandatory `title`"));
     }
     let logsource = parse_logsource(doc, map).map_err(|mut d| diags.append(&mut d)).ok();
     let mut rules = Vec::new();
-    let detection = match map.get("filter").and_then(Value::as_mapping) {
-        Some(fm) => {
+    let detection = match entry(map, "filter") {
+        Some((key, Node { data: YamlData::Mapping(fm), .. })) => {
             rules = get_str_list(fm, "rules");
             if rules.is_empty() {
-                diags.push(path_err(doc, "filter.rules", "`filter.rules` must list at least one rule id or name"));
+                let at = entry(fm, "rules").map_or(key, |(k, _)| k);
+                diags.push(err(at, "filter.rules", "`filter.rules` must list at least one rule id or name"));
             }
-            parse_detection(doc, "filter", fm, &["rules"]).map_err(|mut d| diags.append(&mut d)).ok()
+            parse_detection("filter", key, fm, &["rules"]).map_err(|mut d| diags.append(&mut d)).ok()
         }
-        None => {
-            diags.push(path_err(doc, "filter", "`filter` must be a mapping"));
+        other => {
+            diags.push(err(other.map_or(doc, |(_, v)| v), "filter", "`filter` must be a mapping"));
             None
         }
     };
+    let (line, col) = line_col(doc);
     match (title, logsource, detection) {
         (Some(title), Some(logsource), Some(detection)) if diags.is_empty() => Ok(Filter {
             title,
@@ -1787,73 +1878,87 @@ fn parse_filter(doc: usize, map: &Mapping) -> Result<Filter, Diags> {
             logsource,
             rules,
             detection,
+            line,
+            col,
         }),
         _ => Err(diags),
     }
 }
 
-fn parse_detection(doc: usize, base: &str, dm: &Mapping, reserved: &[&str]) -> Result<Detection, Diags> {
+/// `key` is the `detection:` / `filter:` key node, `dm` its mapping.
+fn parse_detection(base: &str, key: &Node, dm: &Map, reserved: &[&str]) -> Result<Detection, Diags> {
     let mut diags = Vec::new();
     let mut search_ids = Vec::new();
     let mut conditions = Vec::new();
+    let mut condition_at = None;
     for (k, v) in dm {
-        let Some(name) = k.as_str() else {
-            diags.push(path_err(doc, base, "search identifier names must be strings"));
+        let Some(name) = k.data.as_str() else {
+            diags.push(err(k, base, "search identifier names must be strings"));
             continue;
         };
         let path = format!("{base}.{name}");
         match name {
             "condition" => {
-                let sources: Vec<String> = match v {
-                    Value::String(s) => vec![s.clone()],
-                    Value::Sequence(seq) => seq.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                condition_at = Some(line_col(v));
+                let sources: Vec<(&str, &Node)> = match &v.data {
+                    YamlData::Value(Scalar::String(s)) => vec![(s.as_ref(), v)],
+                    YamlData::Sequence(seq) => seq.iter().filter_map(|x| x.data.as_str().map(|s| (s, x))).collect(),
                     _ => {
-                        diags.push(path_err(doc, &path, "`condition` must be a string or a list of strings"));
+                        diags.push(err(v, &path, "`condition` must be a string or a list of strings"));
                         continue;
                     }
                 };
-                for s in sources {
-                    match parse_condition(&s) {
+                for (s, node) in sources {
+                    match parse_condition(s) {
                         Ok(c) => conditions.push(c),
-                        Err(e) => diags.push(path_err(doc, &path, format!("invalid condition: {e}"))),
+                        Err(e) => diags.push(err(node, &path, format!("invalid condition: {e}"))),
                     }
                 }
             }
-            "timeframe" => diags.push(path_err(
-                doc,
+            "timeframe" => diags.push(err(
+                k,
                 &path,
                 "`timeframe` inside `detection` was removed in Sigma 2.0; use a correlation rule",
             )),
             n if reserved.contains(&n) => {}
-            _ => match parse_search_id(doc, &path, name, v) {
+            _ => match parse_search_id(&path, name, k, v) {
                 Ok(s) => search_ids.push(s),
                 Err(mut d) => diags.append(&mut d),
             },
         }
     }
     if conditions.is_empty() && diags.is_empty() {
-        diags.push(path_err(doc, base, "missing `condition`"));
+        diags.push(err(key, base, "missing `condition`"));
     }
-    if diags.is_empty() { Ok(Detection { search_ids, conditions }) } else { Err(diags) }
+    if !diags.is_empty() {
+        return Err(diags);
+    }
+    let (condition_line, condition_col) = condition_at.unwrap_or_else(|| line_col(key));
+    Ok(Detection { search_ids, conditions, condition_line, condition_col })
 }
 
-fn parse_search_id(doc: usize, path: &str, name: &str, v: &Value) -> Result<SearchIdentifier, Diags> {
-    let keyword_item = |values| FieldItem { field: None, modifiers: Vec::new(), values, path: path.to_string() };
-    let alternatives = match v {
-        Value::Mapping(m) => vec![parse_map(doc, path, m)?],
-        Value::Sequence(seq) if !seq.is_empty() && seq.iter().all(Value::is_mapping) => {
+fn parse_search_id(path: &str, name: &str, key: &Node, v: &Node) -> Result<SearchIdentifier, Diags> {
+    let (line, col) = line_col(key);
+    let keyword_item =
+        |values| FieldItem { field: None, modifiers: Vec::new(), values, path: path.to_string(), line, col };
+    let alternatives = match &v.data {
+        YamlData::Mapping(m) => vec![parse_map(path, v, m)?],
+        YamlData::Sequence(seq) if !seq.is_empty() && seq.iter().all(|x| x.data.is_mapping()) => {
             let mut alts = Vec::new();
             for (i, item) in seq.iter().enumerate() {
-                let m = item.as_mapping().expect("checked: every element is a mapping");
-                alts.push(parse_map(doc, &format!("{path}[{i}]"), m)?);
+                if let YamlData::Mapping(m) = &item.data {
+                    alts.push(parse_map(&format!("{path}[{i}]"), item, m)?);
+                }
             }
             alts
         }
-        Value::Sequence(seq) if !seq.is_empty() => vec![vec![keyword_item(parse_values(doc, path, v)?)]],
-        Value::String(_) | Value::Number(_) => vec![vec![keyword_item(parse_values(doc, path, v)?)]],
+        YamlData::Sequence(seq) if !seq.is_empty() => vec![vec![keyword_item(parse_values(path, v)?)]],
+        YamlData::Value(Scalar::String(_) | Scalar::Integer(_) | Scalar::FloatingPoint(_)) => {
+            vec![vec![keyword_item(parse_values(path, v)?)]]
+        }
         _ => {
-            return Err(vec![path_err(
-                doc,
+            return Err(vec![err(
+                v,
                 path,
                 "a search identifier must be a mapping, a list of mappings or a list of keywords",
             )]);
@@ -1862,56 +1967,58 @@ fn parse_search_id(doc: usize, path: &str, name: &str, v: &Value) -> Result<Sear
     Ok(SearchIdentifier { name: name.to_string(), alternatives })
 }
 
-fn parse_map(doc: usize, path: &str, m: &Mapping) -> Result<Vec<FieldItem>, Diags> {
+/// `node` is the mapping node itself, `m` its entries.
+fn parse_map(path: &str, node: &Node, m: &Map) -> Result<Vec<FieldItem>, Diags> {
     let mut items = Vec::new();
     let mut diags = Vec::new();
     if m.is_empty() {
-        diags.push(path_err(doc, path, "empty selection"));
+        diags.push(err(node, path, "empty selection"));
     }
     for (k, v) in m {
-        let Some(key) = k.as_str() else {
-            diags.push(path_err(doc, path, "field names must be strings"));
+        let Some(key) = k.data.as_str() else {
+            diags.push(err(k, path, "field names must be strings"));
             continue;
         };
         let item_path = format!("{path}.{key}");
         let fk = match parse_field_key(key) {
             Ok(fk) => fk,
             Err(msg) => {
-                diags.push(path_err(doc, &item_path, msg));
+                diags.push(err(k, &item_path, msg));
                 continue;
             }
         };
-        match parse_values(doc, &item_path, v) {
-            Ok(values) => items.push(FieldItem { field: fk.field, modifiers: fk.modifiers, values, path: item_path }),
+        let (line, col) = line_col(k);
+        match parse_values(&item_path, v) {
+            Ok(values) => {
+                items.push(FieldItem { field: fk.field, modifiers: fk.modifiers, values, path: item_path, line, col })
+            }
             Err(mut d) => diags.append(&mut d),
         }
     }
     if diags.is_empty() { Ok(items) } else { Err(diags) }
 }
 
-fn parse_values(doc: usize, path: &str, v: &Value) -> Result<Vec<RuleValue>, Diags> {
-    let scalars: Vec<&Value> = match v {
-        Value::Sequence(seq) => seq.iter().collect(),
-        other => vec![other],
+fn parse_values(path: &str, v: &Node) -> Result<Vec<RuleValue>, Diags> {
+    let scalars: Vec<&Node> = match &v.data {
+        YamlData::Sequence(seq) => seq.iter().collect(),
+        _ => vec![v],
     };
     if scalars.is_empty() {
-        return Err(vec![path_err(doc, path, "empty value list")]);
+        return Err(vec![err(v, path, "empty value list")]);
     }
     let mut out = Vec::new();
-    for s in scalars {
+    for s in &scalars {
         match RuleValue::from_yaml(s) {
             Some(rv) => out.push(rv),
             None => {
-                return Err(vec![path_err(doc, path, "values must be scalars (string, number, boolean or null)")]);
+                return Err(vec![err(s, path, "values must be scalars (string, number, boolean or null)")]);
             }
         }
     }
-    if out.len() > 1 && out.contains(&RuleValue::Null) {
-        return Err(vec![path_err(
-            doc,
-            path,
-            "`null` cannot be part of a list of values; use a separate selection",
-        )]);
+    if out.len() > 1
+        && let Some(null) = scalars.iter().find(|s| s.data.is_null())
+    {
+        return Err(vec![err(null, path, "`null` cannot be part of a list of values; use a separate selection")]);
     }
     Ok(out)
 }
@@ -1920,14 +2027,14 @@ fn parse_values(doc: usize, path: &str, v: &Value) -> Result<Vec<RuleValue>, Dia
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test -p zaaf-sigma`
-Expected: all zaaf-sigma tests pass (11 document tests plus earlier ones).
+Expected: all zaaf-sigma tests pass (14 document tests plus earlier ones, 33 in total).
 
 - [ ] **Step 5: fmt, clippy, commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 git add -A
-git commit -m "feat(sigma): parse rules, meta filters and correlation stubs with path diagnostics
+git commit -m "feat(sigma): parse rules, meta filters and correlation stubs with positioned diagnostics
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1948,7 +2055,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `PipelineSet`:
     - `PipelineSet::new(Vec<Pipeline>)`: sorted by priority ascending, stable.
     - `PipelineSet::default()`: empty.
-    - `PipelineSet::load(&[PathBuf]) -> Result<PipelineSet, Diagnostic>`
+    - `PipelineSet::load(&[PathBuf]) -> Result<PipelineSet, Diagnostic>`: an invalid pipeline's diagnostic carries `Location::At` (line and column from `serde-saphyr`) when the position is known.
     - `is_empty()`
     - `map_field(&LogSource, &str) -> MappedField { names: Vec<String>, mapped: bool }`
     - `placeholder(&str) -> Option<&[String]>`: the later pipeline wins.
@@ -1984,8 +2091,11 @@ rust-version.workspace = true
 [dependencies]
 indexmap.workspace = true
 serde.workspace = true
-serde_yaml_ng.workspace = true
+serde-saphyr.workspace = true
 zaaf-sigma.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 ```
 
 `crates/zaaf-pipeline/src/lib.rs` (tests module only for now):
@@ -2054,6 +2164,16 @@ mod tests {
         let err = PipelineSet::load(&[PathBuf::from("/nonexistent/p.yml")]).unwrap_err();
         assert!(err.is_error());
         assert_eq!(err.file.as_deref(), Some(std::path::Path::new("/nonexistent/p.yml")));
+    }
+
+    #[test]
+    fn load_reports_the_position_of_an_invalid_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.yml");
+        std::fs::write(&p, "name: x\ntransformations:\n  - type: drop_everything\n").unwrap();
+        let err = PipelineSet::load(&[p]).unwrap_err();
+        assert!(matches!(err.location, Location::At { line: 3, .. }), "{err:?}");
+        assert!(err.message.contains("drop_everything"), "{err}");
     }
 
     #[test]
@@ -2148,7 +2268,17 @@ pub struct MappedField {
 }
 
 pub fn parse_pipeline(src: &str) -> Result<Pipeline, String> {
-    serde_yaml_ng::from_str(src).map_err(|e| e.to_string())
+    parse_located(src).map_err(|(_, msg)| msg)
+}
+
+/// Parses a pipeline; an error carries its 1-based position when the YAML library knows it.
+fn parse_located(src: &str) -> Result<Pipeline, (Location, String)> {
+    serde_saphyr::from_str(src).map_err(|e| {
+        let location = e
+            .location()
+            .map_or(Location::Unknown, |l| Location::at(l.line() as usize, l.column() as usize, ""));
+        (location, e.without_snippet().to_string())
+    })
 }
 
 /// Pipelines applied in ascending priority order.
@@ -2169,8 +2299,8 @@ impl PipelineSet {
             let src = std::fs::read_to_string(p).map_err(|e| {
                 Diagnostic::error(Location::Unknown, format!("cannot read pipeline: {e}")).with_file(p)
             })?;
-            let pipeline = parse_pipeline(&src).map_err(|e| {
-                Diagnostic::error(Location::Unknown, format!("invalid pipeline: {e}")).with_file(p)
+            let pipeline = parse_located(&src).map_err(|(location, e)| {
+                Diagnostic::error(location, format!("invalid pipeline: {e}")).with_file(p)
             })?;
             pipelines.push(pipeline);
         }
@@ -2223,7 +2353,7 @@ impl PipelineSet {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test -p zaaf-pipeline`
-Expected: 7 tests pass.
+Expected: 8 tests pass.
 
 - [ ] **Step 5: fmt, clippy, commit**
 
@@ -2771,17 +2901,17 @@ fn split_placeholders(text: &str) -> Vec<Piece> {
             i += 2;
             continue;
         }
-        if chars[i] == '%' {
-            if let Some(rel) = chars[i + 1..].iter().position(|&c| c == '%') {
-                let name: String = chars[i + 1..i + 1 + rel].iter().collect();
-                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    if !buf.is_empty() {
-                        out.push(Piece::Text(std::mem::take(&mut buf)));
-                    }
-                    out.push(Piece::Var(name));
-                    i += rel + 2;
-                    continue;
+        if chars[i] == '%'
+            && let Some(rel) = chars[i + 1..].iter().position(|&c| c == '%')
+        {
+            let name: String = chars[i + 1..i + 1 + rel].iter().collect();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                if !buf.is_empty() {
+                    out.push(Piece::Text(std::mem::take(&mut buf)));
                 }
+                out.push(Piece::Var(name));
+                i += rel + 2;
+                continue;
             }
         }
         buf.push(chars[i]);
@@ -2859,6 +2989,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `SourcedDocument { document: Document, source: Option<PathBuf> }`
   - `CompileOutput { rules: Vec<CompiledRule>, diagnostics: Vec<Diagnostic>, filters: usize, correlations_skipped: usize }`
   - `compile(Vec<SourcedDocument>, &PipelineSet) -> CompileOutput`
+  - crate-private `Problem { location: Location, message: String }`: a compile error or warning with its position.
+- Diagnostic positions: item errors and warnings point at the `FieldItem` (its key and YAML path); condition errors at the `condition` value (`detection.condition` or `filter.condition`); duplicate ids, unknown levels, skipped correlations and unused filters at the start of their document (empty path).
 
 Semantics fixed in this task (each one is tested here and again in the conformance suite):
 - **String values:** case-insensitive by default; `cased` makes them case-sensitive.
@@ -2906,6 +3038,10 @@ mod tests {
 
     fn first_error(out: &CompileOutput) -> String {
         out.diagnostics.iter().find(|d| d.is_error()).map(|d| d.message.clone()).unwrap_or_default()
+    }
+
+    fn first_error_location(out: &CompileOutput) -> Location {
+        out.diagnostics.iter().find(|d| d.is_error()).map(|d| d.location.clone()).unwrap_or(Location::Unknown)
     }
 
     fn only_pred(out: &CompileOutput) -> &Predicate {
@@ -2993,6 +3129,20 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_point_at_the_item_the_condition_and_the_document() {
+        let out = compile_detection_src("    s:\n        X|all: single\n    condition: s\n");
+        assert_eq!(first_error_location(&out), Location::at(7, 9, "detection.s.X|all"));
+        let out = compile_detection_src("    s:\n        X: a\n    condition: s and missing\n");
+        assert_eq!(first_error_location(&out), Location::at(8, 16, "detection.condition"));
+        let src = format!(
+            "{}---\ntitle: again\nid: r1\nlogsource:\n    product: x\ndetection:\n    s:\n        A: 1\n    condition: s\n",
+            rule_with("    s:\n        A: 1\n    condition: s\n")
+        );
+        let out = compile_src(&src, &PipelineSet::default());
+        assert_eq!(first_error_location(&out), Location::at(10, 1, ""));
+    }
+
+    #[test]
     fn them_excludes_underscore_identifiers() {
         let out = compile_detection_src("    a:\n        X: 1\n    _b:\n        Y: 1\n    condition: all of them\n");
         assert!(matches!(&out.rules[0].expr, Expr::Pred(_)), "{:?}", out.rules[0].expr);
@@ -3015,6 +3165,7 @@ mod tests {
         let warnings: Vec<_> = out.diagnostics.iter().filter(|d| !d.is_error()).collect();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].message.contains("`User`"));
+        assert_eq!(warnings[0].location, Location::at(8, 9, "detection.s.User"));
     }
 
     #[test]
@@ -3027,7 +3178,8 @@ mod tests {
         assert_eq!(out.filters, 2);
         let Expr::And(parts) = &out.rules[0].expr else { panic!("{:?}", out.rules[0].expr) };
         assert!(matches!(parts[1], Expr::Not(_)));
-        assert!(out.diagnostics.iter().any(|d| d.message.contains("`unused` does not match")));
+        let unused = out.diagnostics.iter().find(|d| d.message.contains("`unused` does not match")).unwrap();
+        assert_eq!(unused.location, Location::at(19, 1, ""));
     }
 
     #[test]
@@ -3160,7 +3312,7 @@ pub(crate) fn compile_item(
         Some(field) => {
             let mapped = pipelines.map_field(logsource, field);
             if !pipelines.is_empty() && !mapped.mapped {
-                warnings.push(format!("{}: field `{field}` is not mapped by any pipeline", item.path));
+                warnings.push(format!("field `{field}` is not mapped by any pipeline"));
             }
             Target::Fields(mapped.names)
         }
@@ -3188,10 +3340,7 @@ pub(crate) fn compile_item(
             let RuleValue::Str(src) = v else { return Err("`re` needs string values".into()) };
             let re = CompiledRegex::new(src, flags)?;
             if re.needs_backtracking() {
-                warnings.push(format!(
-                    "{}: regex `{src}` needs the backtracking engine (limit {BACKTRACK_LIMIT} steps)",
-                    item.path
-                ));
+                warnings.push(format!("regex `{src}` needs the backtracking engine (limit {BACKTRACK_LIMIT} steps)"));
             }
             out.push(pred(Matcher::Regex(re)));
         }
@@ -3298,7 +3447,9 @@ use crate::item::{and, compile_item, or};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use zaaf_pipeline::PipelineSet;
-use zaaf_sigma::{CondExpr, Detection, Diagnostic, Document, Location, LogSource, Quantifier, SelTarget, SigmaString};
+use zaaf_sigma::{
+    CondExpr, Detection, Diagnostic, Document, FieldItem, Location, LogSource, Quantifier, SelTarget, SigmaString,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Level {
@@ -3373,6 +3524,24 @@ pub struct CompileOutput {
     pub correlations_skipped: usize,
 }
 
+/// A compile error or warning and where in the rule file it points.
+#[derive(Debug)]
+pub(crate) struct Problem {
+    location: Location,
+    message: String,
+}
+
+impl Problem {
+    fn item(item: &FieldItem, message: String) -> Self {
+        Self { location: Location::at(item.line, item.col, item.path.clone()), message }
+    }
+}
+
+/// The start of a document; used for diagnostics about the document as a whole.
+fn document_at(line: usize, col: usize) -> Location {
+    Location::at(line, col, "")
+}
+
 fn located(d: Diagnostic, source: &Option<PathBuf>) -> Diagnostic {
     match source {
         Some(p) => d.with_file(p.clone()),
@@ -3380,12 +3549,12 @@ fn located(d: Diagnostic, source: &Option<PathBuf>) -> Diagnostic {
     }
 }
 
-fn error(source: &Option<PathBuf>, msg: String) -> Diagnostic {
-    located(Diagnostic::error(Location::Unknown, msg), source)
+fn error(source: &Option<PathBuf>, location: Location, msg: String) -> Diagnostic {
+    located(Diagnostic::error(location, msg), source)
 }
 
-fn warning(source: &Option<PathBuf>, msg: String) -> Diagnostic {
-    located(Diagnostic::warning(Location::Unknown, msg), source)
+fn warning(source: &Option<PathBuf>, location: Location, msg: String) -> Diagnostic {
+    located(Diagnostic::warning(location, msg), source)
 }
 
 struct CompiledFilter {
@@ -3393,6 +3562,8 @@ struct CompiledFilter {
     targets: Vec<String>,
     expr: Expr,
     source: Option<PathBuf>,
+    line: usize,
+    col: usize,
     used: bool,
 }
 
@@ -3409,6 +3580,7 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
                 out.correlations_skipped += 1;
                 out.diagnostics.push(warning(
                     &source,
+                    document_at(c.line, c.col),
                     format!("correlation rule `{}` skipped: correlation support arrives in milestone M2", c.title),
                 ));
             }
@@ -3419,37 +3591,48 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
     let mut compiled_filters = Vec::new();
     for (f, source) in filters {
         let mut warnings = Vec::new();
-        match compile_detection(&f.detection, &f.logsource, pipelines, &mut warnings) {
+        match compile_detection(&f.detection, "filter", &f.logsource, pipelines, &mut warnings) {
             Ok(expr) => compiled_filters.push(CompiledFilter {
                 title: f.title.clone(),
                 targets: f.rules.clone(),
                 expr,
                 source: source.clone(),
+                line: f.line,
+                col: f.col,
                 used: false,
             }),
-            Err(e) => out.diagnostics.push(error(&source, format!("filter `{}`: {e}", f.title))),
+            Err(p) => out.diagnostics.push(error(&source, p.location, format!("filter `{}`: {}", f.title, p.message))),
         }
-        out.diagnostics
-            .extend(warnings.into_iter().map(|w| warning(&source, format!("filter `{}`: {w}", f.title))));
+        out.diagnostics.extend(
+            warnings
+                .into_iter()
+                .map(|w| warning(&source, w.location, format!("filter `{}`: {}", f.title, w.message))),
+        );
     }
 
     let mut seen = HashSet::new();
     for (r, source) in rules {
         let mut warnings = Vec::new();
-        let compiled = compile_detection(&r.detection, &r.logsource, pipelines, &mut warnings);
-        out.diagnostics
-            .extend(warnings.into_iter().map(|w| warning(&source, format!("rule `{}`: {w}", r.meta.title))));
+        let compiled = compile_detection(&r.detection, "detection", &r.logsource, pipelines, &mut warnings);
+        out.diagnostics.extend(
+            warnings
+                .into_iter()
+                .map(|w| warning(&source, w.location, format!("rule `{}`: {}", r.meta.title, w.message))),
+        );
         let mut expr = match compiled {
             Ok(e) => e,
-            Err(e) => {
-                out.diagnostics.push(error(&source, format!("rule `{}`: {e}", r.meta.title)));
+            Err(p) => {
+                out.diagnostics.push(error(&source, p.location, format!("rule `{}`: {}", r.meta.title, p.message)));
                 continue;
             }
         };
         let id = r.meta.id.clone().unwrap_or_else(|| format!("title:{}", r.meta.title));
         if !seen.insert(id.clone()) {
-            out.diagnostics
-                .push(error(&source, format!("duplicate rule id `{id}`; rule `{}` skipped", r.meta.title)));
+            out.diagnostics.push(error(
+                &source,
+                document_at(r.line, r.col),
+                format!("duplicate rule id `{id}`; rule `{}` skipped", r.meta.title),
+            ));
             continue;
         }
         for f in &mut compiled_filters {
@@ -3464,8 +3647,11 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
         let level = match r.meta.level.as_deref() {
             None => Level::Medium,
             Some(s) => Level::parse(s).unwrap_or_else(|| {
-                out.diagnostics
-                    .push(warning(&source, format!("rule `{}`: unknown level `{s}`, using medium", r.meta.title)));
+                out.diagnostics.push(warning(
+                    &source,
+                    document_at(r.line, r.col),
+                    format!("rule `{}`: unknown level `{s}`, using medium", r.meta.title),
+                ));
                 Level::Medium
             }),
         };
@@ -3488,32 +3674,47 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
         });
     }
     for f in compiled_filters.iter().filter(|f| !f.used) {
-        out.diagnostics.push(warning(&f.source, format!("filter `{}` does not match any loaded rule", f.title)));
+        out.diagnostics.push(warning(
+            &f.source,
+            document_at(f.line, f.col),
+            format!("filter `{}` does not match any loaded rule", f.title),
+        ));
     }
     out
 }
 
+/// `base` is `detection` for rules and `filter` for meta filters (the YAML path of the block).
 pub(crate) fn compile_detection(
     det: &Detection,
+    base: &str,
     logsource: &LogSource,
     pipelines: &PipelineSet,
-    warnings: &mut Vec<String>,
-) -> Result<Expr, String> {
+    warnings: &mut Vec<Problem>,
+) -> Result<Expr, Problem> {
     let mut ids: Vec<(String, Expr)> = Vec::new();
     for sid in &det.search_ids {
         let mut alternatives = Vec::new();
         for alt in &sid.alternatives {
             let mut items = Vec::new();
             for item in alt {
-                items.push(
-                    compile_item(item, logsource, pipelines, warnings).map_err(|e| format!("{}: {e}", item.path))?,
-                );
+                let mut item_warnings = Vec::new();
+                let compiled = compile_item(item, logsource, pipelines, &mut item_warnings);
+                warnings.extend(item_warnings.into_iter().map(|w| Problem::item(item, w)));
+                items.push(compiled.map_err(|e| Problem::item(item, e))?);
             }
             alternatives.push(and(items));
         }
         ids.push((sid.name.clone(), or(alternatives)));
     }
-    let conditions = det.conditions.iter().map(|c| resolve(c, &ids)).collect::<Result<Vec<_>, _>>()?;
+    let conditions = det
+        .conditions
+        .iter()
+        .map(|c| resolve(c, &ids))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| Problem {
+            location: Location::at(det.condition_line, det.condition_col, format!("{base}.condition")),
+            message,
+        })?;
     Ok(or(conditions))
 }
 
@@ -3788,10 +3989,10 @@ fn lookup<'a>(v: &'a Value, segs: &[&str], found: &mut Vec<&'a Value>) -> bool {
         Value::Object(map) => {
             for k in (1..=segs.len()).rev() {
                 let key = segs[..k].join(".");
-                if let Some(child) = map.get(&key) {
-                    if lookup(child, &segs[k..], found) {
-                        return true;
-                    }
+                if let Some(child) = map.get(&key)
+                    && lookup(child, &segs[k..], found)
+                {
+                    return true;
                 }
             }
             false
@@ -3950,8 +4151,9 @@ mod tests {
         Evaluator::new(out.rules)
     }
 
+    /// Quoted so that ids such as `null` stay strings in YAML.
     fn rule(id: &str, detection: &str) -> String {
-        format!("title: {id}\nid: {id}\nlogsource:\n    product: test\ndetection:\n{detection}")
+        format!("title: '{id}'\nid: '{id}'\nlogsource:\n    product: test\ndetection:\n{detection}")
     }
 
     fn hits(e: &Evaluator, json: &str) -> Vec<String> {
@@ -4269,7 +4471,7 @@ Expected: compile errors for the missing `read_json_events` and `EventResult`.
 
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use zaaf_event::JsonEvent;
 
@@ -4369,9 +4571,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Produces:
   - `rules::collect_rule_files(&[PathBuf]) -> (Vec<PathBuf>, Vec<Diagnostic>)`: recursive, sorted, `.yml`/`.yaml` only. An explicitly named file is accepted whatever its extension.
   - `rules::load_rules(&[PathBuf], &PipelineSet) -> LoadedRules { output: CompileOutput, files: usize, diagnostics: Vec<Diagnostic> }`
-  - `check::diagnostic_json(&Diagnostic) -> serde_json::Value`
+  - `check::diagnostic_json(&Diagnostic) -> serde_json::Value`: `{severity, file, line, col, path, message}`. `line`, `col` and `path` are null for `Location::Unknown`; `path` is also null when the position has no YAML path.
   - The `zaaf check [-p PIPELINE]… [--format text|json] [-q] PATHS…` command. It exits 0 when there are no errors and 2 otherwise.
-  - The JSON report: `{files, rules, filters, correlations_skipped, errors, warnings, diagnostics: [{severity, file, location, message}]}`. Task 14 relies on this.
+  - The JSON report: `{files, rules, filters, correlations_skipped, errors, warnings, diagnostics: [{severity, file, line, col, path, message}]}`. Task 14 relies on `files`, `diagnostics[].severity`, `diagnostics[].file` and `diagnostics[].message`.
 
 - [ ] **Step 1: Write the failing integration tests**
 
@@ -4446,7 +4648,10 @@ fn invalid_rule_exits_two_with_yaml_path() {
         .arg(dir.path())
         .assert()
         .code(2)
-        .stdout(predicate::str::contains("detection.sel.CommandLine|nope").and(predicate::str::contains("unknown modifier")));
+        .stdout(
+            predicate::str::contains("bad.yml:7:9: detection.sel.CommandLine|nope")
+                .and(predicate::str::contains("unknown modifier")),
+        );
 }
 
 #[test]
@@ -4465,7 +4670,26 @@ fn json_report_and_correlation_warning() {
     assert_eq!(report["files"], 1);
     assert_eq!(report["rules"], 1);
     assert_eq!(report["correlations_skipped"], 1);
-    assert_eq!(report["diagnostics"][0]["severity"], "warning");
+    let d = &report["diagnostics"][0];
+    assert_eq!(d["severity"], "warning");
+    assert_eq!(d["line"], 10);
+    assert_eq!(d["col"], 1);
+    assert!(d["path"].is_null());
+    assert!(d["file"].as_str().unwrap().ends_with("r.yml"));
+}
+
+#[test]
+fn json_report_carries_positions_and_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("bad.yml"), BAD).unwrap();
+    let out = zaaf().args(["check", "--format", "json"]).arg(dir.path()).assert().code(2).get_output().stdout.clone();
+    let report: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let d = &report["diagnostics"][0];
+    assert_eq!(d["severity"], "error");
+    assert_eq!(d["line"], 7);
+    assert_eq!(d["col"], 9);
+    assert_eq!(d["path"], "detection.sel.CommandLine|nope");
+    assert!(d["message"].as_str().unwrap().contains("unknown modifier"));
 }
 
 #[test]
@@ -4599,16 +4823,19 @@ pub enum DiagFormat {
     Json,
 }
 
+/// One diagnostic as JSON. `line`, `col` and `path` are null when unknown; `path`
+/// is also null when the position has no YAML path (syntax errors, whole documents).
 pub fn diagnostic_json(d: &Diagnostic) -> Value {
-    let location = match &d.location {
-        Location::Unknown => Value::Null,
-        Location::LineCol { line, col } => json!(format!("{line}:{col}")),
-        Location::Path { doc, path } => json!(format!("doc {doc}: {path}")),
+    let (line, col, path) = match &d.location {
+        Location::Unknown => (None, None, None),
+        Location::At { line, col, path } => (Some(*line), Some(*col), (!path.is_empty()).then_some(path.as_str())),
     };
     json!({
         "severity": if d.is_error() { "error" } else { "warning" },
         "file": d.file.as_ref().map(|p| p.display().to_string()),
-        "location": location,
+        "line": line,
+        "col": col,
+        "path": path,
         "message": d.message,
     })
 }
@@ -4693,7 +4920,7 @@ fn main() -> ExitCode {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test -p zaaf-cli --test check`
-Expected: 4 tests pass.
+Expected: 5 tests pass.
 
 - [ ] **Step 5: fmt, clippy, commit**
 
@@ -5268,10 +5495,10 @@ pub fn run(args: HuntArgs) -> u8 {
                 }
             };
             stats.events += 1;
-            if let Some(ts) = event.timestamp() {
-                if from.is_some_and(|f| ts < f) || to.is_some_and(|t| ts > t) {
-                    continue;
-                }
+            if let Some(ts) = event.timestamp()
+                && (from.is_some_and(|f| ts < f) || to.is_some_and(|t| ts > t))
+            {
+                continue;
             }
             for idx in evaluator.matching_rules(&event) {
                 stats.matches += 1;
@@ -5339,7 +5566,7 @@ fn main() -> ExitCode {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test -p zaaf-cli`
-Expected: 3 output unit tests, 4 check tests and 4 hunt tests pass. Also try it by hand: `printf '{"CommandLine":"whoami"}\n' | cargo run -q -p zaaf-cli -- hunt -r <dir-with-WHOAMI-rule> -o table` renders a one-row table.
+Expected: 3 output unit tests, 5 check tests and 4 hunt tests pass. Also try it by hand: `printf '{"CommandLine":"whoami"}\n' | cargo run -q -p zaaf-cli -- hunt -r <dir-with-WHOAMI-rule> -o table` renders a one-row table.
 
 - [ ] **Step 5: fmt, clippy, commit**
 
@@ -5391,7 +5618,7 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
-serde_yaml_ng.workspace = true
+serde-saphyr.workspace = true
 zaaf-eval.workspace = true
 zaaf-input.workspace = true
 zaaf-ir.workspace = true
@@ -5540,7 +5767,7 @@ pub fn run_case(dir: &Path) -> CaseResult {
 
     let spec: CaseSpec = match fs::read_to_string(dir.join("case.yml"))
         .map_err(|e| e.to_string())
-        .and_then(|s| serde_yaml_ng::from_str(&s).map_err(|e| e.to_string()))
+        .and_then(|s| serde_saphyr::from_str(&s).map_err(|e| e.to_string()))
     {
         Ok(s) => s,
         Err(e) => return fail(format!("case.yml: {e}")),
@@ -7242,6 +7469,7 @@ Expected:
 | Spec item | Task |
 |---|---|
 | §3.2 `zaaf-sigma` (rules, filters, correlation stub, diagnostics) | 1–4 |
+| §3.2 Diagnostics as `file:line:col` with the YAML path (parse, pipeline, compile, `check` text and JSON) | 1, 4, 5, 7, 11 |
 | §3.2 `zaaf-pipeline` (core: field mapping, conditions, vars) | 5 |
 | §3.2 `zaaf-ir` (all modifiers resolved at compile time, meta filters folded) | 6–7 |
 | §3.2 `zaaf-event` (JSON), `zaaf-eval` (reference) | 8–9 |
