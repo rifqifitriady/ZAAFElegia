@@ -103,6 +103,14 @@ impl CompiledRegex {
         self.limit_hits.load(Ordering::Relaxed)
     }
 
+    /// The same compiled engine with a new, zeroed hit counter not shared with `self`.
+    pub fn with_fresh_counter(&self) -> CompiledRegex {
+        CompiledRegex {
+            limit_hits: Arc::default(),
+            ..self.clone()
+        }
+    }
+
     /// Identity of the shared hit counter: clones report the same id.
     pub fn counter_id(&self) -> usize {
         Arc::as_ptr(&self.limit_hits) as usize

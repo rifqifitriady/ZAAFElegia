@@ -20,7 +20,7 @@ impl Evaluator {
     }
 
     /// `(rule index, hits)` for every rule whose regexes hit the backtrack limit, in rule order.
-    /// A limit hit evaluates as "no match"; this reports it so evasion is visible.
+    /// Counts are cumulative since the evaluator was built. A limit hit evaluates as "no match"; this reports it so evasion is visible.
     pub fn regex_limit_hits(&self) -> Vec<(usize, u64)> {
         self.rules
             .iter()
@@ -58,7 +58,10 @@ fn eval_predicate(p: &Predicate, event: &dyn Event) -> bool {
             .any(|v| value_matches(&p.matcher, v)),
         Target::Fields(fields) => match &p.matcher {
             Matcher::Exists(want) => fields.iter().any(|f| event.get(f).is_some()) == *want,
-            Matcher::Null => fields.iter().any(|f| match event.get(f) {
+            // Mirrors `Exists(false)`: true only when EVERY mapped alternative is absent or
+            // contains a JSON null. A field that is present with a real value (even if
+            // another alternative is null) makes the predicate false.
+            Matcher::Null => fields.iter().all(|f| match event.get(f) {
                 None => true,
                 Some(values) => values.iter().any(|v| matches!(v, FieldValue::Null)),
             }),
@@ -92,14 +95,21 @@ fn value_matches(m: &Matcher, v: &FieldValue) -> bool {
         },
         Matcher::Regex(re) => v.as_text().is_some_and(|t| re.is_match(&t)),
         Matcher::Num { op, value } => v.as_f64().is_some_and(|x| compare(*op, x, *value)),
-        Matcher::Cidr(net) => v
-            .as_text()
-            .and_then(|t| t.trim().parse::<IpAddr>().ok())
-            .is_some_and(|ip| net.contains(&ip)),
+        Matcher::Cidr(net) => v.as_text().and_then(|t| parse_ip(&t)).is_some_and(|ip| {
+            // IPv4-mapped IPv6 addresses count as the IPv4 address they wrap.
+            net.contains(&ip.to_canonical())
+        }),
         Matcher::TimePart { part, op, value } => timestamp_of(v)
             .is_some_and(|ts| compare(*op, time_part(ts, *part) as f64, *value as f64)),
         Matcher::Exists(_) | Matcher::Null | Matcher::FieldRef { .. } => false,
     }
+}
+
+/// Trims, drops an IPv6 `%zone` suffix and parses. Leading-zero dotted quads stay rejected.
+fn parse_ip(text: &str) -> Option<IpAddr> {
+    let t = text.trim();
+    let t = t.split_once('%').map_or(t, |(addr, _zone)| addr);
+    t.parse().ok()
 }
 
 fn compare(op: CmpOp, a: f64, b: f64) -> bool {
@@ -295,6 +305,82 @@ mod tests {
         });
         let event = JsonEvent::new(serde_json::json!({"b": "X"}));
         assert!(eval_expr(&expr, &event));
+    }
+
+    fn null_expr(fields: &[&str]) -> Expr {
+        Expr::Pred(Predicate {
+            target: Target::Fields(fields.iter().map(|s| s.to_string()).collect()),
+            matcher: Matcher::Null,
+        })
+    }
+
+    #[test]
+    fn null_over_several_fields_requires_every_alternative_absent_or_null() {
+        let e = null_expr(&["a", "b"]);
+        let ev = |v: serde_json::Value| JsonEvent::new(v);
+        assert!(!eval_expr(&e, &ev(serde_json::json!({"a": "x"}))));
+        assert!(eval_expr(&e, &ev(serde_json::json!({}))));
+        assert!(eval_expr(&e, &ev(serde_json::json!({"a": null}))));
+        assert!(!eval_expr(
+            &e,
+            &ev(serde_json::json!({"a": null, "b": "y"}))
+        ));
+    }
+
+    #[test]
+    fn cidr_handles_mapped_ipv6_zones_and_rejects_outsiders() {
+        let cidr = |net: &str| {
+            Expr::Pred(Predicate {
+                target: Target::Fields(vec!["ip".into()]),
+                matcher: Matcher::Cidr(net.parse().unwrap()),
+            })
+        };
+        let hit = |net: &str, ip: &str| {
+            eval_expr(&cidr(net), &JsonEvent::new(serde_json::json!({ "ip": ip })))
+        };
+        assert!(hit("10.0.0.0/8", "::ffff:10.1.2.3"));
+        assert!(hit("fe80::/10", "fe80::1%12"));
+        assert!(hit("10.0.0.0/8", " 10.1.2.3 "));
+        assert!(!hit("10.0.0.0/8", "8.8.8.8"));
+        assert!(!hit("10.0.0.0/8", "010.1.2.3"));
+    }
+
+    #[test]
+    fn folded_filter_regex_hits_are_credited_only_to_the_rule_that_ran_it() {
+        let src = format!(
+            "{}---\n{}---\ntitle: f\nlogsource:\n    product: test\nfilter:\n    rules: [r1, r2]\n    sel:\n        Image|re: '^(a|a)*\\1$'\n    condition: sel\n",
+            rule(
+                "r1",
+                "    s:\n        Image|startswith: aaa\n    condition: s\n"
+            ),
+            rule("r2", "    s:\n        Other: nope\n    condition: s\n"),
+        );
+        let e = evaluator(&src);
+        assert!(e.regex_limit_hits().is_empty());
+        let event = JsonEvent::new(serde_json::json!({"Image": format!("{}b", "a".repeat(40))}));
+        // r1's selection matches, so its folded filter regex runs, gives up and the
+        // event is not silenced. r2's selection fails, so its regex never runs.
+        assert_eq!(e.matching_rules(&event), vec![0]);
+        let reported = e.regex_limit_hits();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].0, 0);
+        assert!(reported[0].1 >= 1);
+    }
+
+    #[test]
+    fn five_thousand_filters_evaluate_on_the_default_stack() {
+        let mut src = rule("r1", "    s:\n        Image: a\n    condition: s\n");
+        for i in 0..5000 {
+            src.push_str(&format!(
+                "---\ntitle: f{i}\nlogsource:\n    product: test\nfilter:\n    rules: [r1]\n    sel:\n        U: v{i}\n    condition: sel\n"
+            ));
+        }
+        let e = evaluator(&src);
+        assert_eq!(
+            hits(&e, r#"{"Image": "a", "U": "v77"}"#),
+            Vec::<String>::new()
+        );
+        assert_eq!(hits(&e, r#"{"Image": "a", "U": "other"}"#), vec!["r1"]);
     }
 
     #[test]

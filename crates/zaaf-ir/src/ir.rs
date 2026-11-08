@@ -22,6 +22,25 @@ impl Expr {
         seen.values().sum()
     }
 
+    /// Deep copy in which every regex has its own zeroed limit-hit counter.
+    pub fn with_fresh_regex_counters(&self) -> Expr {
+        match self {
+            Expr::And(v) => Expr::And(v.iter().map(Expr::with_fresh_regex_counters).collect()),
+            Expr::Or(v) => Expr::Or(v.iter().map(Expr::with_fresh_regex_counters).collect()),
+            Expr::Not(e) => Expr::Not(Box::new(e.with_fresh_regex_counters())),
+            Expr::Pred(p) => {
+                let matcher = match &p.matcher {
+                    Matcher::Regex(re) => Matcher::Regex(re.with_fresh_counter()),
+                    m => m.clone(),
+                };
+                Expr::Pred(Predicate {
+                    target: p.target.clone(),
+                    matcher,
+                })
+            }
+        }
+    }
+
     fn collect_hits(&self, seen: &mut HashMap<usize, u64>) {
         match self {
             Expr::And(v) | Expr::Or(v) => v.iter().for_each(|e| e.collect_hits(seen)),
@@ -92,7 +111,7 @@ pub enum Matcher {
     Cidr(ipnet::IpNet),
     /// Field present (any value, even null or empty) == the flag.
     Exists(bool),
-    /// Field absent or JSON null.
+    /// True when every mapped alternative is absent or JSON null (mirrors `Exists(false)`).
     Null,
     /// Compares the field with other field(s) of the same event.
     FieldRef {

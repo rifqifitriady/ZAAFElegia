@@ -267,6 +267,10 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             ));
             continue;
         }
+        // Filters fold flat: one `And([rule, Not(f1), Not(f2), ..])`, so the expression
+        // depth does not depend on how many filters target the rule.
+        let mut nots: Vec<Expr> = Vec::new();
+        let mut folded_weight = weight(&expr);
         for f in &mut compiled_filters {
             let targeted = f.targets.iter().any(|t| {
                 r.meta.id.as_deref() == Some(t.as_str())
@@ -274,7 +278,7 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             });
             if targeted {
                 f.used = true;
-                if weight(&expr) + f.preds > MAX_RULE_PREDICATES {
+                if folded_weight + f.preds > MAX_RULE_PREDICATES {
                     out.diagnostics.push(error(
                         &source,
                         document_at(r.line, r.col),
@@ -282,8 +286,16 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
                     ));
                     continue 'rules;
                 }
-                expr = Expr::And(vec![expr, Expr::Not(Box::new(f.expr.clone()))]);
+                // Fresh regex counters: limit hits must be credited to the rule that ran them.
+                nots.push(Expr::Not(Box::new(f.expr.with_fresh_regex_counters())));
+                folded_weight += f.preds;
             }
+        }
+        if !nots.is_empty() {
+            let mut terms = Vec::with_capacity(nots.len() + 1);
+            terms.push(expr);
+            terms.extend(nots);
+            expr = Expr::And(terms);
         }
         let rule_weight = weight(&expr);
         if total + rule_weight > MAX_TOTAL_WEIGHT {
@@ -709,6 +721,30 @@ mod tests {
             .find(|d| d.message.contains("`unused` does not match"))
             .unwrap();
         assert_eq!(unused.location, Location::at(19, 1, ""));
+    }
+
+    fn expr_depth(e: &Expr) -> usize {
+        match e {
+            Expr::And(v) | Expr::Or(v) => 1 + v.iter().map(expr_depth).max().unwrap_or(0),
+            Expr::Not(e) => 1 + expr_depth(e),
+            Expr::Pred(_) => 1,
+        }
+    }
+
+    #[test]
+    fn many_filters_fold_flat_without_deepening_the_expression() {
+        let mut src = rule_with("    s:\n        Image: a\n    condition: s\n");
+        for i in 0..5000 {
+            src.push_str(&format!(
+                "---\ntitle: f{i}\nlogsource:\n    product: windows\nfilter:\n    rules: [r1]\n    sel:\n        U: v{i}\n    condition: sel\n"
+            ));
+        }
+        let out = compile_src(&src, &PipelineSet::default());
+        assert_eq!(out.rules.len(), 1, "{:?}", out.diagnostics);
+        let expr = &out.rules[0].expr;
+        let Expr::And(parts) = expr else { panic!() };
+        assert_eq!(parts.len(), 5001);
+        assert!(expr_depth(expr) <= 70, "depth {}", expr_depth(expr));
     }
 
     #[test]
