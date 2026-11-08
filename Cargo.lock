@@ -735,6 +735,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zaaf-input"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "zaaf-event",
+]
+
+[[package]]
 name = "zaaf-ir"
 version = "0.0.1"
 dependencies = [
