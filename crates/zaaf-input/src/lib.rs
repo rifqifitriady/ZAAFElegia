@@ -222,13 +222,15 @@ impl<R: BufRead> Iterator for Lines<R> {
 }
 
 pub fn open_path(path: &Path) -> std::io::Result<Box<dyn Iterator<Item = EventResult>>> {
-    let file = File::open(path)?;
-    if file.metadata()?.is_dir() {
+    // Check before opening: on Windows, opening a directory already fails with
+    // "Access is denied", which would hide the clearer message below.
+    if std::fs::metadata(path)?.is_dir() {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             "is a directory",
         ));
     }
+    let file = File::open(path)?;
     Ok(read_json_events(BufReader::new(file)))
 }
 

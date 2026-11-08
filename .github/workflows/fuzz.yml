@@ -22,7 +22,7 @@ jobs:
       - name: Fuzz ${{ matrix.target }}
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then SECS=600; else SECS=30; fi
-          cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=$SECS -timeout=10
+          cd fuzz && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=$SECS -timeout=10
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
