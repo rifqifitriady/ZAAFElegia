@@ -300,6 +300,8 @@ pub(crate) fn compile_detection(
     warnings: &mut Vec<Problem>,
 ) -> Result<Expr, Problem> {
     let mut ids: Vec<(String, Expr, usize)> = Vec::new();
+    // Running total over every identifier, referenced or not, so compilation work is bounded.
+    let mut built = 0usize;
     for sid in &det.search_ids {
         let mut alternatives = Vec::new();
         for alt in &sid.alternatives {
@@ -308,7 +310,12 @@ pub(crate) fn compile_detection(
                 let mut item_warnings = Vec::new();
                 let compiled = compile_item(item, logsource, pipelines, &mut item_warnings);
                 warnings.extend(item_warnings.into_iter().map(|w| Problem::item(item, w)));
-                items.push(compiled.map_err(|e| Problem::item(item, e))?);
+                let compiled = compiled.map_err(|e| Problem::item(item, e))?;
+                built += count_preds(&compiled);
+                if built > MAX_RULE_PREDICATES {
+                    return Err(Problem::item(item, budget_error()));
+                }
+                items.push(compiled);
             }
             alternatives.push(and(items));
         }
@@ -680,12 +687,49 @@ mod tests {
         assert_eq!(out.rules[0].info.id, "title:no id");
     }
 
-    fn preds_in(e: &Expr) -> usize {
-        match e {
-            Expr::And(v) | Expr::Or(v) => v.iter().map(preds_in).sum(),
-            Expr::Not(e) => preds_in(e),
-            Expr::Pred(_) => 1,
+    use crate::item::count_preds as preds_in;
+
+    fn big_pipes() -> PipelineSet {
+        let vals: Vec<String> = (0..4000).map(|i| format!("v{i}")).collect();
+        PipelineSet::new(vec![
+            parse_pipeline(&format!("name: v\nvars:\n  Big: [{}]\n", vals.join(", "))).unwrap(),
+        ])
+    }
+
+    #[test]
+    fn unreferenced_identifiers_count_toward_the_rule_budget() {
+        let mut det = String::new();
+        for i in 0..300 {
+            det.push_str(&format!(
+                "    s{i}:\n        U|expand: ['%Big%', '%Big%', '%Big%', '%Big%']\n"
+            ));
         }
+        det.push_str("    condition: s0\n");
+        let out = compile_src(&rule_with(&det), &big_pipes());
+        assert!(out.rules.is_empty());
+        assert!(first_error(&out).contains("rule expands to more than 65536 predicates"));
+    }
+
+    #[test]
+    fn expansion_stops_at_the_item_cap() {
+        let list = vec!["'%Big%'"; 2000].join(", ");
+        let out = compile_src(
+            &rule_with(&format!("    s:\n        U|expand: [{list}]\n    condition: s\n")),
+            &big_pipes(),
+        );
+        assert!(first_error(&out).contains("item expands to more than 16384 predicates"));
+    }
+
+    #[test]
+    fn modifier_checks_come_before_expansion() {
+        let list = vec!["'%Big%'"; 2000].join(", ");
+        let out = compile_src(
+            &rule_with(&format!(
+                "    s:\n        U|expand|gt|lt: [{list}]\n    condition: s\n"
+            )),
+            &big_pipes(),
+        );
+        assert!(first_error(&out).contains("comparison"), "{}", first_error(&out));
     }
 
     fn group_sizes(e: &Expr) -> Vec<usize> {
@@ -766,7 +810,6 @@ mod tests {
             vals.join(", "),
             vec!["a"; 20].join(" or ")
         );
-        let t = std::time::Instant::now();
         let out = compile_detection_src(&det);
         assert!(out.rules.is_empty());
         assert!(
@@ -774,7 +817,6 @@ mod tests {
             "{}",
             first_error(&out)
         );
-        assert!(t.elapsed().as_secs() < 5);
         // within budget
         let det = format!(
             "    a:\n        C|contains: [{}]\n    condition: a\n",

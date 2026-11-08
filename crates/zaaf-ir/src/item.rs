@@ -118,8 +118,6 @@ pub(crate) fn compile_item(
         })
     };
     let case_sensitive = has(Cased);
-    let groups = expand_values(&item.values, has(Expand), pipelines)?;
-    let flat: Vec<&RuleValue> = groups.iter().flatten().collect();
 
     let any_transform = mods.iter().any(|m| STRING_TRANSFORMS.contains(m));
     let transform_names = || {
@@ -145,6 +143,9 @@ pub(crate) fn compile_item(
             transform_names()
         ));
     }
+
+    let groups = expand_values(&item.values, has(Expand), pipelines)?;
+    let flat: Vec<&RuleValue> = groups.iter().flatten().collect();
 
     let mut total = 0usize;
     // One entry per original value; each holds that value's variants.
@@ -345,14 +346,22 @@ fn expand_values(
     }
     let lookup = |name: &str| pipelines.placeholder(name).map(<[String]>::to_vec);
     let mut out = Vec::new();
+    let mut count = 0usize;
     for v in values {
-        out.push(match v {
+        let group: Vec<RuleValue> = match v {
             RuleValue::Str(s) => transform::expand_raw(s, &lookup)?
                 .into_iter()
                 .map(RuleValue::Str)
                 .collect(),
             other => vec![other.clone()],
-        });
+        };
+        count += group.len();
+        if count > MAX_ITEM_PREDICATES {
+            return Err(format!(
+                "item expands to more than {MAX_ITEM_PREDICATES} predicates"
+            ));
+        }
+        out.push(group);
     }
     Ok(out)
 }
