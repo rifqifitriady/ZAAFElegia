@@ -12,6 +12,20 @@ pub enum Expr {
     Pred(Predicate),
 }
 
+impl Expr {
+    /// Total backtrack-limit hits over every regex in the expression.
+    pub fn regex_limit_hits(&self) -> u64 {
+        match self {
+            Expr::And(v) | Expr::Or(v) => v.iter().map(Expr::regex_limit_hits).sum(),
+            Expr::Not(e) => e.regex_limit_hits(),
+            Expr::Pred(p) => match &p.matcher {
+                Matcher::Regex(re) => re.limit_hits(),
+                _ => 0,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Predicate {
     pub target: Target,
@@ -83,4 +97,33 @@ pub enum Matcher {
         op: CmpOp,
         value: i64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::regex_engine::RegexFlags;
+
+    fn pred(re: CompiledRegex) -> Expr {
+        Expr::Pred(Predicate {
+            target: Target::Fields(vec!["f".to_string()]),
+            matcher: Matcher::Regex(re),
+        })
+    }
+
+    #[test]
+    fn regex_limit_hits_sum_over_the_tree() {
+        let mk = || {
+            CompiledRegex::with_backtrack_limit(r"^(a|a)*\1$", RegexFlags::default(), 10).unwrap()
+        };
+        let (a, b) = (mk(), mk());
+        let text = format!("{}b", "a".repeat(200));
+        assert!(!a.is_match(&text));
+        assert!(!b.is_match(&text));
+        assert!(!b.is_match(&text));
+        let expected = a.limit_hits() + b.limit_hits();
+        assert!(expected >= 2);
+        let e = Expr::Or(vec![pred(a), Expr::Not(Box::new(pred(b)))]);
+        assert_eq!(e.regex_limit_hits(), expected);
+    }
 }

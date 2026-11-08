@@ -2,6 +2,8 @@
 //! backtracking limit only for patterns that need lookaround or backreferences.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum backtracking steps for patterns that need the backtracking engine.
 pub const BACKTRACK_LIMIT: usize = 1_000_000;
@@ -24,10 +26,20 @@ pub struct CompiledRegex {
     source: String,
     flags: RegexFlags,
     engine: Engine,
+    /// Backtrack-limit hits; clones share the counter.
+    limit_hits: Arc<AtomicU64>,
 }
 
 impl CompiledRegex {
     pub fn new(source: &str, flags: RegexFlags) -> Result<Self, String> {
+        Self::with_backtrack_limit(source, flags, BACKTRACK_LIMIT)
+    }
+
+    pub fn with_backtrack_limit(
+        source: &str,
+        flags: RegexFlags,
+        limit: usize,
+    ) -> Result<Self, String> {
         let linear = regex::RegexBuilder::new(source)
             .case_insensitive(flags.insensitive)
             .multi_line(flags.multiline)
@@ -38,6 +50,7 @@ impl CompiledRegex {
                 source: source.to_string(),
                 flags,
                 engine: Engine::Linear(re),
+                limit_hits: Arc::default(),
             }),
             Err(linear_err) => {
                 let mut inline = String::new();
@@ -56,24 +69,38 @@ impl CompiledRegex {
                     format!("(?{inline}){source}")
                 };
                 fancy_regex::RegexBuilder::new(&pattern)
-                    .backtrack_limit(BACKTRACK_LIMIT)
+                    .backtrack_limit(limit)
                     .build()
                     .map(|re| Self {
                         source: source.to_string(),
                         flags,
                         engine: Engine::Backtracking(re),
+                        limit_hits: Arc::default(),
                     })
-                    .map_err(|_| format!("invalid regular expression `{source}`: {linear_err}"))
+                    .map_err(|fancy_err| {
+                        format!(
+                            "invalid regular expression `{source}`: {linear_err}; backtracking engine: {fancy_err}"
+                        )
+                    })
             }
         }
     }
 
-    /// Unanchored search. A pattern that exceeds the backtracking limit does not match.
+    /// Unanchored search. A pattern that exceeds the backtracking limit does not
+    /// match, but the hit is counted (see `limit_hits`).
     pub fn is_match(&self, text: &str) -> bool {
         match &self.engine {
             Engine::Linear(re) => re.is_match(text),
-            Engine::Backtracking(re) => re.is_match(text).unwrap_or(false),
+            Engine::Backtracking(re) => re.is_match(text).unwrap_or_else(|_| {
+                self.limit_hits.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
         }
+    }
+
+    /// How many times the backtracking engine gave up (shared across clones).
+    pub fn limit_hits(&self) -> u64 {
+        self.limit_hits.load(Ordering::Relaxed)
     }
 
     pub fn needs_backtracking(&self) -> bool {
@@ -154,5 +181,29 @@ mod tests {
     fn invalid_regex_is_an_error() {
         let err = CompiledRegex::new("(unclosed", RegexFlags::default()).unwrap_err();
         assert!(err.contains("(unclosed"), "{err}");
+    }
+
+    #[test]
+    fn backtrack_limit_hit_is_counted_and_not_a_match() {
+        let re =
+            CompiledRegex::with_backtrack_limit(r"^(a|a)*\1$", RegexFlags::default(), 10).unwrap();
+        assert!(re.needs_backtracking());
+        assert!(!re.is_match(&format!("{}b", "a".repeat(200))));
+        assert!(re.limit_hits() >= 1);
+        let clone = re.clone();
+        assert_eq!(clone.limit_hits(), re.limit_hits());
+    }
+
+    #[test]
+    fn normal_match_leaves_limit_hits_at_zero() {
+        let re = CompiledRegex::new(r"^(?!svchost).*\.exe$", RegexFlags::default()).unwrap();
+        assert!(re.is_match("evil.exe"));
+        assert_eq!(re.limit_hits(), 0);
+    }
+
+    #[test]
+    fn double_failure_reports_both_errors() {
+        let err = CompiledRegex::new("(unclosed", RegexFlags::default()).unwrap_err();
+        assert!(err.contains("backtracking engine"), "{err}");
     }
 }

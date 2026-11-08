@@ -8,6 +8,13 @@ use regex::Regex;
 use std::sync::OnceLock;
 use zaaf_sigma::{Modifier, SigmaString, Tok};
 
+/// Upper bound on variants produced by any value expansion.
+pub(crate) const MAX_EXPANSION: usize = 4096;
+
+fn expansion_error() -> String {
+    format!("value expansion exceeds {MAX_EXPANSION} variants")
+}
+
 /// A value during transformation: a Sigma string, or raw bytes after `utf16*`.
 #[derive(Debug, Clone)]
 pub(crate) enum Val {
@@ -48,6 +55,9 @@ impl Val {
 pub(crate) fn apply(m: Modifier, vals: Vec<Val>) -> Result<Vec<Val>, String> {
     let mut out = Vec::new();
     for v in vals {
+        if out.len() > MAX_EXPANSION {
+            return Err(expansion_error());
+        }
         match m {
             Modifier::Contains => {
                 let mut s = v.into_sigma();
@@ -78,9 +88,12 @@ pub(crate) fn apply(m: Modifier, vals: Vec<Val>) -> Result<Vec<Val>, String> {
             }
             Modifier::Utf16Be => out.push(Val::B(utf16(&v.text(m)?, true, false))),
             Modifier::Utf16 => out.push(Val::B(utf16(&v.text(m)?, false, true))),
-            Modifier::Windash => out.extend(windash(&v.into_sigma()).into_iter().map(Val::S)),
+            Modifier::Windash => out.extend(windash(&v.into_sigma())?.into_iter().map(Val::S)),
             other => return Err(format!("`{}` is not a string transformation", other.name())),
         }
+    }
+    if out.len() > MAX_EXPANSION {
+        return Err(expansion_error());
     }
     Ok(out)
 }
@@ -129,7 +142,7 @@ fn windash_regex() -> &'static Regex {
 }
 
 /// All permutations of command-line flag dashes (`-x`, `/x`, `–x`, `—x`, `―x`).
-pub(crate) fn windash(s: &SigmaString) -> Vec<SigmaString> {
+pub(crate) fn windash(s: &SigmaString) -> Result<Vec<SigmaString>, String> {
     let mut results = vec![SigmaString::default()];
     for tok in s.toks() {
         match tok {
@@ -138,6 +151,9 @@ pub(crate) fn windash(s: &SigmaString) -> Vec<SigmaString> {
                 let mut last = 0;
                 for m in windash_regex().find_iter(text) {
                     let seg = &text[last..m.start()];
+                    if variants.len() * DASHES.len() > MAX_EXPANSION {
+                        return Err(expansion_error());
+                    }
                     variants = variants
                         .into_iter()
                         .flat_map(|v| DASHES.iter().map(move |d| format!("{v}{seg}{d}")))
@@ -147,6 +163,9 @@ pub(crate) fn windash(s: &SigmaString) -> Vec<SigmaString> {
                 let tail = &text[last..];
                 for v in &mut variants {
                     v.push_str(tail);
+                }
+                if results.len() * variants.len() > MAX_EXPANSION {
+                    return Err(expansion_error());
                 }
                 results = results
                     .into_iter()
@@ -166,7 +185,7 @@ pub(crate) fn windash(s: &SigmaString) -> Vec<SigmaString> {
             }
         }
     }
-    results
+    Ok(results)
 }
 
 enum Piece {
@@ -227,6 +246,9 @@ pub(crate) fn expand_raw(
                         "placeholder `%{name}%` has no value; define it under `vars:` in a pipeline"
                     )
                 })?;
+                if results.len() * vals.len() > MAX_EXPANSION {
+                    return Err(expansion_error());
+                }
                 results = results
                     .into_iter()
                     .flat_map(|r| vals.iter().map(move |v| format!("{r}{v}")))
@@ -264,19 +286,19 @@ mod tests {
 
     #[test]
     fn windash_permutes_flag_dashes_only() {
-        let v = windash(&SigmaString::parse(" -s "));
+        let v = windash(&SigmaString::parse(" -s ")).unwrap();
         assert_eq!(v.len(), 5);
         assert!(v.contains(&SigmaString::literal(" /s ")));
         assert!(v.contains(&SigmaString::literal(" \u{2015}s ")));
         assert_eq!(
-            windash(&SigmaString::parse("foo-bar")),
+            windash(&SigmaString::parse("foo-bar")).unwrap(),
             vec![SigmaString::literal("foo-bar")]
         );
     }
 
     #[test]
     fn windash_keeps_wildcards() {
-        let v = windash(&SigmaString::parse("* -a -b*"));
+        let v = windash(&SigmaString::parse("* -a -b*")).unwrap();
         assert_eq!(v.len(), 25);
         assert!(v.iter().all(|s| s.has_wildcards()));
     }
@@ -314,5 +336,32 @@ mod tests {
             vals.into_iter().next().unwrap().into_sigma(),
             SigmaString::literal("YQBiAA==")
         );
+    }
+
+    #[test]
+    fn windash_expansion_is_capped() {
+        let err = windash(&SigmaString::parse(&" -a".repeat(20))).unwrap_err();
+        assert!(err.contains("value expansion exceeds"), "{err}");
+    }
+
+    #[test]
+    fn expand_raw_expansion_is_capped() {
+        let lookup = |_: &str| Some((0..20).map(|i| i.to_string()).collect::<Vec<_>>());
+        let err = expand_raw("%a%%b%%c%", &lookup).unwrap_err();
+        assert!(err.contains("value expansion exceeds"), "{err}");
+    }
+
+    #[test]
+    fn apply_total_output_is_capped() {
+        let vals: Vec<Val> = (0..MAX_EXPANSION)
+            .map(|_| Val::S(SigmaString::literal("a -b")))
+            .collect();
+        let err = apply(Modifier::Windash, vals).unwrap_err();
+        assert!(err.contains("value expansion exceeds"), "{err}");
+    }
+
+    #[test]
+    fn base64_offsets_of_empty_input_is_empty() {
+        assert!(base64_offsets(b"").is_empty());
     }
 }
