@@ -82,11 +82,39 @@ impl Modifier {
     }
 
     pub fn name(self) -> &'static str {
-        TABLE
-            .iter()
-            .find(|(_, m)| *m == self)
-            .map(|(n, _)| *n)
-            .expect("every modifier is listed in TABLE")
+        match self {
+            Modifier::All => "all",
+            Modifier::StartsWith => "startswith",
+            Modifier::EndsWith => "endswith",
+            Modifier::Contains => "contains",
+            Modifier::Exists => "exists",
+            Modifier::Cased => "cased",
+            Modifier::Neq => "neq",
+            Modifier::Windash => "windash",
+            Modifier::Re => "re",
+            Modifier::ReInsensitive => "i",
+            Modifier::ReMultiline => "m",
+            Modifier::ReDotAll => "s",
+            Modifier::Base64 => "base64",
+            Modifier::Base64Offset => "base64offset",
+            Modifier::Utf16Le => "utf16le",
+            Modifier::Utf16Be => "utf16be",
+            Modifier::Utf16 => "utf16",
+            Modifier::Wide => "wide",
+            Modifier::Lt => "lt",
+            Modifier::Lte => "lte",
+            Modifier::Gt => "gt",
+            Modifier::Gte => "gte",
+            Modifier::Minute => "minute",
+            Modifier::Hour => "hour",
+            Modifier::Day => "day",
+            Modifier::Week => "week",
+            Modifier::Month => "month",
+            Modifier::Year => "year",
+            Modifier::Cidr => "cidr",
+            Modifier::Expand => "expand",
+            Modifier::FieldRef => "fieldref",
+        }
     }
 }
 
@@ -105,6 +133,9 @@ pub fn parse_field_key(key: &str) -> Result<FieldKey, String> {
     let field = (!field.is_empty()).then(|| field.to_string());
     let mut modifiers = Vec::new();
     for p in parts {
+        if p.is_empty() {
+            return Err("empty modifier".to_string());
+        }
         match Modifier::parse(p) {
             Some(m) => modifiers.push(m),
             None => return Err(format!("unknown modifier `{p}`")),
@@ -150,6 +181,28 @@ mod tests {
     fn unknown_modifier_is_an_error() {
         let err = parse_field_key("x|bogus").unwrap_err();
         assert!(err.contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn empty_modifier_segment_is_named_as_such() {
+        for key in ["x||all", "x|", "x|all|"] {
+            let err = parse_field_key(key).unwrap_err();
+            assert_eq!(err, "empty modifier", "{key}");
+        }
+    }
+
+    #[test]
+    fn name_parses_back_for_every_variant() {
+        use Modifier::*;
+        let all = [
+            All, StartsWith, EndsWith, Contains, Exists, Cased, Neq, Windash, Re, ReInsensitive,
+            ReMultiline, ReDotAll, Base64, Base64Offset, Utf16Le, Utf16Be, Utf16, Wide, Lt, Lte,
+            Gt, Gte, Minute, Hour, Day, Week, Month, Year, Cidr, Expand, FieldRef,
+        ];
+        assert_eq!(all.len(), TABLE.len(), "variant list out of sync with TABLE");
+        for m in all {
+            assert_eq!(Modifier::parse(m.name()), Some(m), "{m:?}");
+        }
     }
 
     #[test]
