@@ -1,0 +1,7 @@
+[
+  {"CommandLine": "echo \"a]b\"", "n": 1},
+  {"CommandLine": "x]\\", "arr": [1,
+    2]},
+  "str]ing",
+  [ ]
+]

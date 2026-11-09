@@ -8,6 +8,21 @@
 //! error. A single item is capped at 16384 plain predicates. The SigmaHQ corpus (about
 //! 100k predicates) is far below these limits. Compiled regexes use about 1 GiB per run at
 //! most, plus up to the same again in match-time lazy-DFA caches.
+//!
+//! Search identifiers count toward the rule budget whether or not the condition
+//! references them: every identifier is compiled, so an unreferenced one still costs
+//! work and still uses up the budget. A document that fails to compile is charged the
+//! weight it had built before failing, so hostile text cannot dodge the total budget by
+//! failing late. Duplicate rule ids are rejected before any compilation.
+//!
+//! # Meta filters
+//!
+//! A filter targets rules by `id` or `name` only; its own `logsource` is not used to
+//! select rules. The filter's fields are mapped through the pipelines using the
+//! *filter's* logsource, not the targeted rule's. When a logsource part (category,
+//! product, service) that the filter names differs from the targeted rule's, the filter
+//! is still applied and the compiler emits a warning on that rule. A filter that fails
+//! to compile leaves its targeted rules unfiltered; each of those rules gets a warning.
 
 use crate::ir::Expr;
 use crate::item::{and, compile_item, or, weight};
@@ -143,6 +158,7 @@ struct CompiledFilter {
     targets: Vec<String>,
     expr: Expr,
     source: Option<PathBuf>,
+    logsource: LogSource,
     line: usize,
     col: usize,
     used: bool,
@@ -169,49 +185,56 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
     }
     out.filters = filters.len();
 
-    // Running weight over everything kept; once exceeded, the rest is skipped uncompiled.
-    let mut total = 0usize;
-    let mut skipped = 0usize;
-    let mut first_skip: Option<(Option<PathBuf>, Location)> = None;
+    // Running weight over everything kept (plus what failed documents attempted to build);
+    // once exceeded, the rest is skipped uncompiled.
+    let mut budget = Budget::default();
 
     let mut compiled_filters = Vec::new();
+    // Filters that failed to compile: (title, targeted rule ids/names).
+    let mut failed_filters: Vec<(String, Vec<String>)> = Vec::new();
     for (f, source) in filters {
-        if skipped > 0 {
-            skipped += 1;
+        if budget.exceeded() {
+            budget.skipped += 1;
             continue;
         }
         let mut warnings = Vec::new();
+        let mut attempted = 0usize;
         match compile_detection(
             &f.detection,
             "filter",
             &f.logsource,
             pipelines,
             &mut warnings,
+            &mut attempted,
         ) {
-            Ok(expr) if total + weight(&expr) > MAX_TOTAL_WEIGHT => {
-                skipped = 1;
-                first_skip = Some((source.clone(), document_at(f.line, f.col)));
+            Ok(expr) if budget.total + weight(&expr) > MAX_TOTAL_WEIGHT => {
+                budget.skip(&source, document_at(f.line, f.col), true);
                 drop(expr);
             }
             Ok(expr) => {
                 let preds = weight(&expr);
-                total += preds;
+                budget.total += preds;
                 compiled_filters.push(CompiledFilter {
                     title: f.title.clone(),
                     preds,
                     targets: f.rules.clone(),
                     expr,
                     source: source.clone(),
+                    logsource: f.logsource.clone(),
                     line: f.line,
                     col: f.col,
                     used: false,
                 });
             }
-            Err(p) => out.diagnostics.push(error(
-                &source,
-                p.location,
-                format!("filter `{}`: {}", f.title, p.message),
-            )),
+            Err(p) => {
+                out.diagnostics.push(error(
+                    &source,
+                    p.location,
+                    format!("filter `{}`: {}", f.title, p.message),
+                ));
+                failed_filters.push((f.title.clone(), f.rules.clone()));
+                budget.charge(attempted, &source, document_at(f.line, f.col), true);
+            }
         }
         out.diagnostics.extend(warnings.into_iter().map(|w| {
             warning(
@@ -224,17 +247,33 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
 
     let mut seen = HashSet::new();
     'rules: for (r, source) in rules {
-        if skipped > 0 {
-            skipped += 1;
+        if budget.exceeded() {
+            budget.skipped += 1;
+            continue;
+        }
+        let id = r
+            .meta
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("title:{}", r.meta.title));
+        // Checked before compiling: a duplicate costs no work and emits no warnings.
+        if seen.contains(&id) {
+            out.diagnostics.push(error(
+                &source,
+                document_at(r.line, r.col),
+                format!("duplicate rule id `{id}`; rule `{}` skipped", r.meta.title),
+            ));
             continue;
         }
         let mut warnings = Vec::new();
+        let mut attempted = 0usize;
         let compiled = compile_detection(
             &r.detection,
             "detection",
             &r.logsource,
             pipelines,
             &mut warnings,
+            &mut attempted,
         );
         out.diagnostics.extend(warnings.into_iter().map(|w| {
             warning(
@@ -251,39 +290,54 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
                     p.location,
                     format!("rule `{}`: {}", r.meta.title, p.message),
                 ));
+                budget.charge(attempted, &source, document_at(r.line, r.col), false);
                 continue;
             }
         };
-        let id = r
-            .meta
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("title:{}", r.meta.title));
-        if !seen.insert(id.clone()) {
-            out.diagnostics.push(error(
-                &source,
-                document_at(r.line, r.col),
-                format!("duplicate rule id `{id}`; rule `{}` skipped", r.meta.title),
-            ));
-            continue;
+        seen.insert(id.clone());
+        let is_targeted = |targets: &[String]| {
+            targets.iter().any(|t| {
+                r.meta.id.as_deref() == Some(t.as_str())
+                    || r.meta.name.as_deref() == Some(t.as_str())
+            })
+        };
+        for (title, targets) in &failed_filters {
+            if is_targeted(targets) {
+                out.diagnostics.push(warning(
+                    &source,
+                    document_at(r.line, r.col),
+                    format!(
+                        "rule `{}`: filter `{title}` failed to compile; rule runs unfiltered",
+                        r.meta.title
+                    ),
+                ));
+            }
         }
         // Filters fold flat: one `And([rule, Not(f1), Not(f2), ..])`, so the expression
         // depth does not depend on how many filters target the rule.
         let mut nots: Vec<Expr> = Vec::new();
-        let mut folded_weight = weight(&expr);
+        let own_weight = weight(&expr);
+        let mut folded_weight = own_weight;
         for f in &mut compiled_filters {
-            let targeted = f.targets.iter().any(|t| {
-                r.meta.id.as_deref() == Some(t.as_str())
-                    || r.meta.name.as_deref() == Some(t.as_str())
-            });
-            if targeted {
+            if is_targeted(&f.targets) {
                 f.used = true;
+                if let Some(diff) = logsource_mismatch(&f.logsource, &r.logsource) {
+                    out.diagnostics.push(warning(
+                        &source,
+                        document_at(r.line, r.col),
+                        format!(
+                            "rule `{}`: filter `{}` has a different logsource ({diff}); it is still applied, with its fields mapped by the filter's logsource",
+                            r.meta.title, f.title
+                        ),
+                    ));
+                }
                 if folded_weight + f.preds > MAX_RULE_PREDICATES {
                     out.diagnostics.push(error(
                         &source,
                         document_at(r.line, r.col),
                         format!("rule `{}`: {}", r.meta.title, budget_error()),
                     ));
+                    budget.charge(own_weight, &source, document_at(r.line, r.col), false);
                     continue 'rules;
                 }
                 // Fresh regex counters: limit hits must be credited to the rule that ran them.
@@ -298,12 +352,11 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             expr = Expr::And(terms);
         }
         let rule_weight = weight(&expr);
-        if total + rule_weight > MAX_TOTAL_WEIGHT {
-            skipped = 1;
-            first_skip = Some((source.clone(), document_at(r.line, r.col)));
+        if budget.total + rule_weight > MAX_TOTAL_WEIGHT {
+            budget.skip(&source, document_at(r.line, r.col), false);
             continue;
         }
-        total += rule_weight;
+        budget.total += rule_weight;
         let level = match r.meta.level.as_deref() {
             None => Level::Medium,
             Some(s) => Level::parse(s).unwrap_or_else(|| {
@@ -333,32 +386,112 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             expr,
         });
     }
-    if let Some((source, location)) = first_skip {
+    if let Some((source, location, is_filter, crossing_skipped)) = budget.first_skip.clone() {
+        let what = match (crossing_skipped, is_filter) {
+            (true, true) => "this filter and all rules",
+            (true, false) => "this and later rules",
+            // The crossing document failed on its own and has its own error.
+            (false, true) => "later filters and all rules",
+            (false, false) => "later rules",
+        };
         out.diagnostics.push(error(
             &source,
             location,
             format!(
-                "rule set exceeds the total compile budget of {MAX_TOTAL_WEIGHT} units; this and later rules were skipped ({skipped} documents skipped)"
+                "rule set exceeds the total compile budget of {MAX_TOTAL_WEIGHT} units; {what} were skipped ({} documents skipped)",
+                budget.skipped
             ),
         ));
     }
-    for f in compiled_filters.iter().filter(|f| !f.used) {
-        out.diagnostics.push(warning(
-            &f.source,
-            document_at(f.line, f.col),
-            format!("filter `{}` does not match any loaded rule", f.title),
-        ));
+    // With rules skipped by the budget a filter may only look unused because its target was dropped.
+    if !budget.exceeded() {
+        for f in compiled_filters.iter().filter(|f| !f.used) {
+            out.diagnostics.push(warning(
+                &f.source,
+                document_at(f.line, f.col),
+                format!("filter `{}` does not match any loaded rule", f.title),
+            ));
+        }
     }
     out
 }
 
+/// Running weight of a `compile` call and the first document that crossed the total budget.
+#[derive(Default)]
+struct Budget {
+    total: usize,
+    /// Documents skipped uncompiled because of the budget. The crossing document is
+    /// counted only when it was itself skipped, not when it failed with its own error.
+    skipped: usize,
+    /// Source, location, whether the crossing document is a filter, and whether it was
+    /// itself skipped (as opposed to having failed with its own error).
+    first_skip: Option<(Option<PathBuf>, Location, bool, bool)>,
+}
+
+impl Budget {
+    /// Whether the total budget has been crossed; later documents are skipped.
+    fn exceeded(&self) -> bool {
+        self.first_skip.is_some()
+    }
+
+    fn skip(&mut self, source: &Option<PathBuf>, location: Location, is_filter: bool) {
+        self.skipped = 1;
+        self.first_skip = Some((source.clone(), location, is_filter, true));
+    }
+
+    /// Charges the weight a failed document attempted to build, so hostile text that
+    /// fails late still counts toward the total.
+    fn charge(
+        &mut self,
+        attempted: usize,
+        source: &Option<PathBuf>,
+        location: Location,
+        is_filter: bool,
+    ) {
+        self.total = self.total.saturating_add(attempted);
+        if self.total > MAX_TOTAL_WEIGHT && !self.exceeded() {
+            self.first_skip = Some((source.clone(), location, is_filter, false));
+        }
+    }
+}
+
+/// Describes how a filter's logsource differs from a rule's, if it does. A part the
+/// filter leaves unspecified never differs; a part it names must equal the rule's
+/// (compared case-insensitively, with Unicode lowercasing like pipeline conditions).
+fn logsource_mismatch(filter: &LogSource, rule: &LogSource) -> Option<String> {
+    let parts = [
+        ("category", &filter.category, &rule.category),
+        ("product", &filter.product, &rule.product),
+        ("service", &filter.service, &rule.service),
+    ];
+    let diffs: Vec<String> = parts
+        .into_iter()
+        .filter_map(|(name, f, r)| {
+            let f = f.as_deref().filter(|s| !s.is_empty())?;
+            let f_lower = f.to_lowercase();
+            let same = r.as_deref().is_some_and(|r| r.to_lowercase() == f_lower);
+            (!same).then(|| {
+                format!(
+                    "{name}: filter `{f}`, rule {}",
+                    r.as_deref()
+                        .map_or("unset".to_string(), |r| format!("`{r}`"))
+                )
+            })
+        })
+        .collect();
+    (!diffs.is_empty()).then(|| diffs.join("; "))
+}
+
 /// `base` is `detection` for rules and `filter` for meta filters (the YAML path of the block).
+/// `attempted` receives the weight built so far, also when compilation fails, so the
+/// caller can charge it to the total budget.
 pub(crate) fn compile_detection(
     det: &Detection,
     base: &str,
     logsource: &LogSource,
     pipelines: &PipelineSet,
     warnings: &mut Vec<Problem>,
+    attempted: &mut usize,
 ) -> Result<Expr, Problem> {
     let mut ids: Vec<(String, Expr, usize)> = Vec::new();
     // Running total over every identifier, referenced or not, so compilation work is bounded.
@@ -369,10 +502,21 @@ pub(crate) fn compile_detection(
             let mut items = Vec::new();
             for item in alt {
                 let mut item_warnings = Vec::new();
-                let compiled = compile_item(item, logsource, pipelines, &mut item_warnings);
+                let mut item_attempted = 0usize;
+                let compiled = compile_item(
+                    item,
+                    logsource,
+                    pipelines,
+                    &mut item_warnings,
+                    &mut item_attempted,
+                );
                 warnings.extend(item_warnings.into_iter().map(|w| Problem::item(item, w)));
-                let compiled = compiled.map_err(|e| Problem::item(item, e))?;
+                let compiled = compiled.map_err(|e| {
+                    *attempted = built + item_attempted;
+                    Problem::item(item, e)
+                })?;
                 built += weight(&compiled);
+                *attempted = built;
                 if built > MAX_RULE_PREDICATES {
                     return Err(Problem::item(item, budget_error()));
                 }
@@ -385,19 +529,24 @@ pub(crate) fn compile_detection(
         ids.push((sid.name.clone(), expr, cost));
     }
     let mut used = 0usize;
-    let conditions = det
-        .conditions
-        .iter()
-        .map(|c| resolve(c, &ids, &mut used))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|message| Problem {
-            location: Location::at(
-                det.condition_line,
-                det.condition_col,
-                format!("{base}.condition"),
-            ),
-            message,
-        })?;
+    let mut conditions = Vec::new();
+    for (i, c) in det.conditions.iter().enumerate() {
+        match resolve(c, &ids, &mut used) {
+            Ok(e) => conditions.push(e),
+            Err(message) => {
+                // Point at the failing entry of a condition list, not at the first one.
+                let (line, col) = det
+                    .condition_positions
+                    .get(i)
+                    .copied()
+                    .unwrap_or((det.condition_line, det.condition_col));
+                return Err(Problem {
+                    location: Location::at(line, col, format!("{base}.condition")),
+                    message,
+                });
+            }
+        }
+    }
     Ok(or(conditions))
 }
 
@@ -657,6 +806,18 @@ mod tests {
         );
         let out = compile_src(&src, &PipelineSet::default());
         assert_eq!(first_error_location(&out), Location::at(10, 1, ""));
+    }
+
+    #[test]
+    fn condition_list_errors_point_at_the_failing_entry() {
+        let out = compile_detection_src(
+            "    s:\n        X: a\n    condition:\n        - s\n        - s and missing\n",
+        );
+        assert_eq!(
+            first_error_location(&out),
+            Location::at(10, 11, "detection.condition")
+        );
+        assert!(first_error(&out).contains("missing"));
     }
 
     #[test]
@@ -1053,6 +1214,178 @@ mod tests {
         ));
         assert!(out.rules.is_empty());
         assert!(first_error(&out).contains("rule exceeds the budget of 65536 weight units"));
+    }
+
+    fn warnings_of(out: &CompileOutput) -> Vec<String> {
+        out.diagnostics
+            .iter()
+            .filter(|d| !d.is_error())
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    const FILTER_R1: &str = "---\ntitle: f\nlogsource:\n    product: windows\nfilter:\n    rules: [r1]\n    sel:\n        User: x\n    condition: sel\n";
+
+    #[test]
+    fn logsource_mismatch_is_unicode_case_insensitive() {
+        let ls = |p: &str| LogSource {
+            product: Some(p.to_string()),
+            ..Default::default()
+        };
+        assert!(logsource_mismatch(&ls("WİNDOWS"), &ls("windows")).is_some());
+        assert!(logsource_mismatch(&ls("ÄÖ"), &ls("äö")).is_none());
+        assert!(logsource_mismatch(&ls("Windows"), &ls("WINDOWS")).is_none());
+    }
+
+    #[test]
+    fn filter_with_a_different_logsource_warns_per_targeted_rule() {
+        let src = format!(
+            "{}---\ntitle: f\nlogsource:\n    product: linux\n    service: auth\nfilter:\n    rules: [r1]\n    sel:\n        User: x\n    condition: sel\n",
+            rule_with("    s:\n        Image: a\n    condition: s\n")
+        );
+        let out = compile_src(&src, &PipelineSet::default());
+        assert_eq!(out.rules.len(), 1);
+        let w = warnings_of(&out);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("filter `f`") && w[0].contains("logsource"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("rule `t`"), "{w:?}");
+    }
+
+    #[test]
+    fn filter_with_a_matching_or_unspecified_logsource_does_not_warn() {
+        let src = format!(
+            "{}{FILTER_R1}---\ntitle: g\nlogsource:\n    category: ''\nfilter:\n    rules: [r1]\n    sel:\n        User: y\n    condition: sel\n",
+            rule_with("    s:\n        Image: a\n    condition: s\n")
+        );
+        let out = compile_src(&src, &PipelineSet::default());
+        assert!(warnings_of(&out).is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn rules_targeted_by_a_failed_filter_get_a_warning() {
+        let src = format!(
+            "{}---\ntitle: broken\nlogsource:\n    product: windows\nfilter:\n    rules: [r1]\n    sel:\n        User: x\n    condition: nope\n",
+            rule_with("    s:\n        Image: a\n    condition: s\n")
+        );
+        let out = compile_src(&src, &PipelineSet::default());
+        assert_eq!(out.rules.len(), 1);
+        assert!(matches!(out.rules[0].expr, Expr::Pred(_)));
+        assert!(out.diagnostics.iter().any(|d| d.is_error()));
+        let w = warnings_of(&out);
+        assert!(
+            w.iter().any(|m| m.contains("rule `t`")
+                && m.contains("filter `broken` failed to compile; rule runs unfiltered")),
+            "{w:?}"
+        );
+        // no spurious "does not match any loaded rule" for the broken filter
+        assert!(!w.iter().any(|m| m.contains("does not match")), "{w:?}");
+    }
+
+    #[test]
+    fn fieldref_targets_are_checked_for_unmapped_fields() {
+        let pipes = PipelineSet::new(vec![parse_pipeline(
+            "name: m\ntransformations:\n  - type: field_name_mapping\n    mapping:\n      Image: process.executable\n",
+        )
+        .unwrap()]);
+        let out = compile_src(
+            &rule_with("    s:\n        Image|fieldref: Other\n    condition: s\n"),
+            &pipes,
+        );
+        let w = warnings_of(&out);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("`Other`") && w[0].contains("not mapped"),
+            "{w:?}"
+        );
+        // a mapped fieldref target does not warn
+        let out = compile_src(
+            &rule_with("    s:\n        Image|fieldref: Image\n    condition: s\n"),
+            &pipes,
+        );
+        assert!(warnings_of(&out).is_empty());
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected_before_compiling() {
+        let pipes = PipelineSet::new(vec![parse_pipeline(
+            "name: m\ntransformations:\n  - type: field_name_mapping\n    mapping:\n      Image: process.executable\n",
+        )
+        .unwrap()]);
+        let one = rule_with("    s:\n        Image: a\n    condition: s\n");
+        let dup = rule_with("    s:\n        Unmapped: a\n    condition: s\n");
+        let out = compile_src(&format!("{one}---\n{dup}"), &pipes);
+        assert_eq!(out.rules.len(), 1);
+        assert!(first_error(&out).contains("duplicate rule id `r1`"));
+        // the duplicate was never compiled, so its unmapped field is not reported
+        assert!(warnings_of(&out).is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn a_rule_that_fails_its_budget_is_still_charged_to_the_total() {
+        // Each rule builds ~65.5k units before failing its own budget.
+        let vals: Vec<String> = (0..5000).map(|i| format!("'v{i}'")).collect();
+        let one = |n: usize| {
+            format!(
+                "title: t{n}\nid: r{n}\nlogsource:\n    product: windows\ndetection:\n    s:\n        C|re: [{}]\n    condition: s\n",
+                vals.join(", ")
+            )
+        };
+        let src: Vec<String> = (0..24).map(one).collect();
+        let out = compile_src(&src.join("---\n"), &PipelineSet::default());
+        assert!(out.rules.is_empty());
+        let errs: Vec<String> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            errs.iter().any(|m| m.contains("total compile budget")),
+            "{} errors, none about the total budget",
+            errs.len()
+        );
+        // The budget cut the work short: not all 24 rules were attempted.
+        assert!(errs.len() < 24, "{}", errs.len());
+        // Every attempted rule (including the crossing one) has its own error; only
+        // the rest were skipped, so the crossing document is not in the count.
+        let attempted = errs.len() - 1;
+        let total = errs
+            .iter()
+            .find(|m| m.contains("total compile budget"))
+            .unwrap();
+        assert!(
+            total.contains(&format!("({} documents skipped)", 24 - attempted)),
+            "{total}"
+        );
+        assert!(total.contains("later rules were skipped"), "{total}");
+    }
+
+    #[test]
+    fn a_filter_crossing_the_total_budget_says_so_and_unused_warnings_are_suppressed() {
+        let vals: Vec<String> = (0..3750).map(|i| format!("'v{i}'")).collect();
+        let filter = |n: usize| {
+            format!(
+                "title: f{n}\nlogsource:\n    product: windows\nfilter:\n    rules: [nomatch]\n    sel:\n        C|re: [{}]\n    condition: sel\n",
+                vals.join(", ")
+            )
+        };
+        let mut src: Vec<String> = (0..17).map(filter).collect();
+        src.push(rule_with("    s:\n        Image: a\n    condition: s\n"));
+        let out = compile_src(&src.join("---\n"), &PipelineSet::default());
+        assert!(out.rules.is_empty());
+        let msg = first_error(&out);
+        assert!(msg.contains("total compile budget"), "{msg}");
+        assert!(msg.contains("this filter and all rules"), "{msg}");
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.message.contains("does not match any loaded rule")),
+            "{:?}",
+            out.diagnostics
+        );
     }
 
     #[test]

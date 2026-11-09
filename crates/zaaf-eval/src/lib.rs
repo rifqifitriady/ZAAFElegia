@@ -2,17 +2,26 @@
 //! evaluator (DataFusion, M4) is tested against it.
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
+use std::borrow::Cow;
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::rc::Rc;
 use zaaf_event::{Event, FieldValue, parse_timestamp, timestamp_from_epoch};
-use zaaf_ir::{CmpOp, CompiledRule, Expr, Matcher, Predicate, RefMode, Target, TimePart};
+use zaaf_ir::{
+    CmpOp, CompiledRule, Expr, LimitCounter, Matcher, Predicate, RefMode, Target, TimePart,
+};
 
 pub struct Evaluator {
     rules: Vec<CompiledRule>,
+    /// Per rule, the distinct regex hit counters, collected once at construction.
+    counters: Vec<Vec<LimitCounter>>,
 }
 
 impl Evaluator {
     pub fn new(rules: Vec<CompiledRule>) -> Self {
-        Self { rules }
+        let counters = rules.iter().map(|r| r.expr.regex_counters()).collect();
+        Self { rules, counters }
     }
 
     pub fn rules(&self) -> &[CompiledRule] {
@@ -22,48 +31,118 @@ impl Evaluator {
     /// `(rule index, hits)` for every rule whose regexes hit the backtrack limit, in rule order.
     /// Counts are cumulative since the evaluator was built. A limit hit evaluates as "no match"; this reports it so evasion is visible.
     pub fn regex_limit_hits(&self) -> Vec<(usize, u64)> {
-        self.rules
+        self.counters
             .iter()
             .enumerate()
-            .map(|(i, r)| (i, r.expr.regex_limit_hits()))
+            .map(|(i, cs)| (i, cs.iter().map(LimitCounter::hits).sum::<u64>()))
             .filter(|(_, n)| *n > 0)
             .collect()
     }
 
     /// Indexes (into `rules()`) of every rule that matches `event`, in rule order.
     pub fn matching_rules(&self, event: &dyn Event) -> Vec<usize> {
+        // One cache per event: leaf values, field lookups and lower-cased texts are
+        // computed at most once however many rules and predicates read them.
+        let ctx = EventCtx::new(event);
         self.rules
             .iter()
             .enumerate()
-            .filter(|(_, r)| eval_expr(&r.expr, event))
+            .filter(|(_, r)| eval_with(&r.expr, &ctx))
             .map(|(i, _)| i)
             .collect()
     }
 }
 
 pub fn eval_expr(expr: &Expr, event: &dyn Event) -> bool {
-    match expr {
-        Expr::And(items) => items.iter().all(|e| eval_expr(e, event)),
-        Expr::Or(items) => items.iter().any(|e| eval_expr(e, event)),
-        Expr::Not(inner) => !eval_expr(inner, event),
-        Expr::Pred(p) => eval_predicate(p, event),
+    eval_with(expr, &EventCtx::new(event))
+}
+
+/// A scalar of the event plus its lazily computed lower-cased text.
+struct Cached<'e> {
+    value: FieldValue<'e>,
+    lower: OnceCell<Option<String>>,
+}
+
+impl<'e> Cached<'e> {
+    fn new(value: FieldValue<'e>) -> Self {
+        Self {
+            value,
+            lower: OnceCell::new(),
+        }
+    }
+
+    /// The text of the value, lower-cased; `None` for null.
+    fn lower(&self) -> Option<&str> {
+        self.lower
+            .get_or_init(|| self.value.as_text().map(|t| t.to_lowercase()))
+            .as_deref()
     }
 }
 
-fn eval_predicate(p: &Predicate, event: &dyn Event) -> bool {
+type Values<'e> = Option<Rc<Vec<Cached<'e>>>>;
+
+/// Per-event memo of everything the event can be asked more than once.
+struct EventCtx<'e> {
+    event: &'e dyn Event,
+    leaves: OnceCell<Vec<Cached<'e>>>,
+    fields: RefCell<HashMap<String, Values<'e>>>,
+}
+
+impl<'e> EventCtx<'e> {
+    fn new(event: &'e dyn Event) -> Self {
+        Self {
+            event,
+            leaves: OnceCell::new(),
+            fields: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn leaves(&self) -> &[Cached<'e>] {
+        self.leaves.get_or_init(|| {
+            self.event
+                .leaf_values()
+                .into_iter()
+                .map(Cached::new)
+                .collect()
+        })
+    }
+
+    /// Same as `Event::get`, memoized.
+    fn get(&self, path: &str) -> Values<'e> {
+        if let Some(hit) = self.fields.borrow().get(path) {
+            return hit.clone();
+        }
+        let values = self
+            .event
+            .get(path)
+            .map(|vs| Rc::new(vs.into_iter().map(Cached::new).collect()));
+        self.fields
+            .borrow_mut()
+            .insert(path.to_string(), values.clone());
+        values
+    }
+}
+
+fn eval_with(expr: &Expr, ctx: &EventCtx) -> bool {
+    match expr {
+        Expr::And(items) => items.iter().all(|e| eval_with(e, ctx)),
+        Expr::Or(items) => items.iter().any(|e| eval_with(e, ctx)),
+        Expr::Not(inner) => !eval_with(inner, ctx),
+        Expr::Pred(p) => eval_predicate(p, ctx),
+    }
+}
+
+fn eval_predicate(p: &Predicate, ctx: &EventCtx) -> bool {
     match &p.target {
-        Target::AnyField => event
-            .leaf_values()
-            .iter()
-            .any(|v| value_matches(&p.matcher, v)),
+        Target::AnyField => ctx.leaves().iter().any(|v| value_matches(&p.matcher, v)),
         Target::Fields(fields) => match &p.matcher {
-            Matcher::Exists(want) => fields.iter().any(|f| event.get(f).is_some()) == *want,
+            Matcher::Exists(want) => fields.iter().any(|f| ctx.get(f).is_some()) == *want,
             // Mirrors `Exists(false)`: true only when EVERY mapped alternative is absent or
             // contains a JSON null (so `["a", null]` counts as null). A field that is
             // present with no null (even `[]` or `{}`) makes the predicate false.
-            Matcher::Null => fields.iter().all(|f| match event.get(f) {
+            Matcher::Null => fields.iter().all(|f| match ctx.get(f) {
                 None => true,
-                Some(values) => values.iter().any(|v| matches!(v, FieldValue::Null)),
+                Some(values) => values.iter().any(|v| matches!(v.value, FieldValue::Null)),
             }),
             Matcher::FieldRef {
                 other,
@@ -72,27 +151,29 @@ fn eval_predicate(p: &Predicate, event: &dyn Event) -> bool {
             } => fields.iter().any(|f| {
                 other
                     .iter()
-                    .any(|o| fieldref(event, f, o, *mode, *case_sensitive))
+                    .any(|o| fieldref(ctx, f, o, *mode, *case_sensitive))
             }),
             m => fields.iter().any(|f| {
-                event
-                    .get(f)
+                ctx.get(f)
                     .is_some_and(|values| values.iter().any(|v| value_matches(m, v)))
             }),
         },
     }
 }
 
-fn value_matches(m: &Matcher, v: &FieldValue) -> bool {
+fn value_matches(m: &Matcher, c: &Cached) -> bool {
+    let v = &c.value;
     match m {
         Matcher::Str {
             pattern,
             case_sensitive,
-        } => match v.as_text() {
-            Some(t) if *case_sensitive => pattern.matches(&t),
-            Some(t) => pattern.matches(&t.to_lowercase()),
-            None => false,
-        },
+        } => {
+            if *case_sensitive {
+                v.as_text().is_some_and(|t| pattern.matches(&t))
+            } else {
+                c.lower().is_some_and(|t| pattern.matches(t))
+            }
+        }
         Matcher::Regex(re) => v.as_text().is_some_and(|t| re.is_match(&t)),
         Matcher::Num { op, value } => v.as_f64().is_some_and(|x| compare(*op, x, *value)),
         Matcher::Cidr(net) => v.as_text().and_then(|t| parse_ip(&t)).is_some_and(|ip| {
@@ -130,6 +211,7 @@ fn timestamp_of(v: &FieldValue) -> Option<DateTime<Utc>> {
     match v {
         FieldValue::Str(s) => parse_timestamp(s),
         FieldValue::Int(i) => timestamp_from_epoch(*i as f64),
+        FieldValue::Uint(u) => timestamp_from_epoch(*u as f64),
         FieldValue::Float(f) => timestamp_from_epoch(*f),
         FieldValue::Bool(_) | FieldValue::Null => None,
     }
@@ -146,34 +228,31 @@ fn time_part(ts: DateTime<Utc>, part: TimePart) -> i64 {
     }
 }
 
-fn fieldref(
-    event: &dyn Event,
-    field: &str,
-    other: &str,
-    mode: RefMode,
-    case_sensitive: bool,
-) -> bool {
-    let (Some(left), Some(right)) = (event.get(field), event.get(other)) else {
+fn fieldref(ctx: &EventCtx, field: &str, other: &str, mode: RefMode, case_sensitive: bool) -> bool {
+    let (Some(left), Some(right)) = (ctx.get(field), ctx.get(other)) else {
         return false;
     };
-    let norm = |v: &FieldValue| {
-        v.as_text().map(|t| {
-            if case_sensitive {
-                t.into_owned()
-            } else {
-                t.to_lowercase()
-            }
+    fn norm<'a>(c: &'a Cached<'_>, case_sensitive: bool) -> Option<Cow<'a, str>> {
+        if case_sensitive {
+            c.value.as_text().map(|t| Cow::Owned(t.into_owned()))
+        } else {
+            c.lower().map(Cow::Borrowed)
+        }
+    }
+    let rights: Vec<_> = right
+        .iter()
+        .filter_map(|c| norm(c, case_sensitive))
+        .collect();
+    left.iter()
+        .filter_map(|c| norm(c, case_sensitive))
+        .any(|l| {
+            rights.iter().any(|r| match mode {
+                RefMode::Equals => l == *r,
+                RefMode::Contains => l.contains(r.as_ref()),
+                RefMode::StartsWith => l.starts_with(r.as_ref()),
+                RefMode::EndsWith => l.ends_with(r.as_ref()),
+            })
         })
-    };
-    let rights: Vec<String> = right.iter().filter_map(norm).collect();
-    left.iter().filter_map(norm).any(|l| {
-        rights.iter().any(|r| match mode {
-            RefMode::Equals => &l == r,
-            RefMode::Contains => l.contains(r.as_str()),
-            RefMode::StartsWith => l.starts_with(r.as_str()),
-            RefMode::EndsWith => l.ends_with(r.as_str()),
-        })
-    })
 }
 
 #[cfg(test)]
@@ -375,6 +454,54 @@ mod tests {
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert_eq!(reported[0].0, 0);
         assert!(reported[0].1 >= 1);
+    }
+
+    #[test]
+    fn per_event_caching_does_not_change_results() {
+        // Keywords, cased and uncased strings, fieldrefs and Exists/Null over shared fields,
+        // evaluated together (shared cache) and one by one (fresh cache) must agree.
+        let docs = [
+            rule(
+                "k1",
+                "    k:\n        - 'MiMi'\n        - 'x*z'\n    condition: k\n",
+            ),
+            rule("k2", "    k:\n        - 'mimi'\n    condition: k\n"),
+            rule(
+                "s1",
+                "    s:\n        A|contains: 'ÀB'\n        B|cased: 'Xy'\n    condition: s\n",
+            ),
+            rule("s2", "    s:\n        A: ['àb', 'q']\n    condition: s\n"),
+            rule(
+                "r1",
+                "    s:\n        A|fieldref|contains: B\n    condition: s\n",
+            ),
+            rule(
+                "r2",
+                "    s:\n        A|fieldref|cased: B\n    condition: s\n",
+            ),
+            rule("n1", "    s:\n        N: null\n    condition: s\n"),
+            rule("e1", "    s:\n        N|exists: true\n    condition: s\n"),
+            rule("g1", "    s:\n        Num|gt: 5\n    condition: s\n"),
+        ];
+        let e = evaluator(&docs.join("---\n"));
+        let events = [
+            r#"{"A": "xÀBz", "B": "àb", "N": null, "Num": "7", "t": "MIMI"}"#,
+            r#"{"A": "Xy", "B": "Xy", "Num": 3, "t": ["x1z"]}"#,
+            r#"{"A": ["q", "ÀB"], "B": ["XY", "xy"], "n": {"mimi": 1}}"#,
+            r#"{}"#,
+            r#"{"A": 5, "B": 5.0, "N": [], "Num": 18446744073709551615}"#,
+        ];
+        for json in events {
+            let event = JsonEvent::new(serde_json::from_str(json).unwrap());
+            let together = e.matching_rules(&event);
+            let alone: Vec<usize> = (0..e.rules().len())
+                .filter(|&i| eval_expr(&e.rules()[i].expr, &event))
+                .collect();
+            assert_eq!(together, alone, "{json}");
+        }
+        // sanity: the first event really matches several rules
+        let event = JsonEvent::new(serde_json::from_str(events[0]).unwrap());
+        assert!(e.matching_rules(&event).len() >= 4);
     }
 
     #[test]

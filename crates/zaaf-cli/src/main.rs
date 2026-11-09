@@ -32,7 +32,10 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let code = catch_unwind(AssertUnwindSafe(|| {
-        // Test hook for the exit-code-4 contract; compiled out of release builds.
+        // Test hook for the exit-code-4 contract. It exists only when `debug_assertions`
+        // is on, so it is compiled out of `--release` builds and the exit-4 test
+        // (`internal_panic_exits_four`, also `#[cfg(debug_assertions)]`) does not run
+        // under `cargo test --release`.
         #[cfg(debug_assertions)]
         if std::env::var_os("ZAAF_INTERNAL_PANIC_TEST").is_some_and(|v| v == "1") {
             panic!("zaaf internal panic test");

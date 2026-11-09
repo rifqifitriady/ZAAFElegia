@@ -1,0 +1,7 @@
+title: eq
+id: c011-eq
+logsource: {product: test}
+detection:
+    s:
+        Port: 443
+    condition: s

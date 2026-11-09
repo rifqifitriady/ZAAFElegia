@@ -365,3 +365,86 @@ fn invalid_json_array_input_is_unreadable_and_exits_three() {
         .code(3)
         .stderr(predicate::str::contains("1 unreadable inputs"));
 }
+
+#[test]
+fn max_line_bytes_flag_sets_the_ndjson_line_cap() {
+    let dir = setup();
+    let long = format!(
+        "{{\"CommandLine\": \"whoami {}\"}}\n{{\"CommandLine\": \"cmd /c whoami\"}}\n",
+        "x".repeat(300)
+    );
+    fs::write(dir.path().join("long.ndjson"), long).unwrap();
+    let run = |extra: &[&str]| {
+        zaaf()
+            .arg("hunt")
+            .arg("-r")
+            .arg(dir.path().join("rules"))
+            .args(["-o", "ndjson"])
+            .args(extra)
+            .arg(dir.path().join("long.ndjson"))
+            .output()
+            .unwrap()
+    };
+    let default = run(&[]);
+    let stderr = String::from_utf8(default.stderr).unwrap();
+    assert!(stderr.contains("2 events, 0 malformed records"), "{stderr}");
+    let capped = run(&["--max-line-bytes", "100"]);
+    let stderr = String::from_utf8(capped.stderr).unwrap();
+    assert!(
+        stderr.contains("long.ndjson:1: line exceeds 100 bytes"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 events, 1 malformed records"), "{stderr}");
+    assert_eq!(capped.status.code(), Some(0));
+}
+
+#[test]
+fn max_line_bytes_must_be_positive() {
+    let dir = setup();
+    hunt(dir.path())
+        .args(["--max-line-bytes", "0"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn json_array_streams_events_before_a_broken_element() {
+    let dir = setup();
+    fs::write(
+        dir.path().join("arr.json"),
+        "[\n{\"CommandLine\": \"cmd /c whoami\"},\n{\"CommandLine\": }\n]",
+    )
+    .unwrap();
+    let out = zaaf()
+        .arg("hunt")
+        .arg("-r")
+        .arg(dir.path().join("rules"))
+        .arg(dir.path().join("arr.json"))
+        .args(["-o", "ndjson"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("r-whoami"), "{stdout}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("arr.json:3: invalid JSON array"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 events"), "{stderr}");
+}
+
+#[test]
+fn invalid_json_array_error_carries_its_line_number() {
+    let dir = setup();
+    fs::write(
+        dir.path().join("b.json"),
+        "[\n{\"CommandLine\": \"a\"},\n{\"CommandLine\": }\n]",
+    )
+    .unwrap();
+    hunt(dir.path())
+        .arg(dir.path().join("b.json"))
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("b.json:3: invalid JSON array: "));
+}

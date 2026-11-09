@@ -1,0 +1,5 @@
+{"DestinationIp": "10.1.2.3"}
+{"DestinationIp": "fd12::1"}
+[1,2,3]
+"string"
+{"EventTime": "2026-11-07T03:15:00Z"}

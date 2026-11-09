@@ -9,7 +9,10 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use zaaf_eval::Evaluator;
 use zaaf_event::Event;
-use zaaf_input::{EventResult, open_path, read_json_events};
+use zaaf_input::{
+    EventResult, MAX_ARRAY_BYTES, MAX_LINE_BYTES, open_path_with_limits,
+    read_json_events_with_limits,
+};
 use zaaf_ir::{CompiledRule, Level};
 use zaaf_pipeline::PipelineSet;
 
@@ -44,7 +47,9 @@ pub struct HuntArgs {
     /// Processing pipeline files, applied in priority order
     #[arg(short = 'p', long = "pipeline")]
     pub pipelines: Vec<PathBuf>,
-    /// Output format [default: table on a terminal, ndjson otherwise]
+    /// Output format [default: table on a terminal, ndjson otherwise]. `ndjson` and `csv`
+    /// stream; `json` and `table` hold every finding in memory until the end of the run
+    /// (`json` is one array)
     #[arg(short = 'o', long = "output", value_enum)]
     pub output: Option<OutputFormat>,
     /// Only run rules at or above this level
@@ -68,9 +73,24 @@ pub struct HuntArgs {
     /// Abort after this many malformed records (exit 3)
     #[arg(long, default_value_t = 1000)]
     pub max_errors: usize,
+    /// Longest accepted NDJSON line in bytes; longer lines are malformed records
+    #[arg(
+        long,
+        default_value_t = MAX_LINE_BYTES,
+        value_parser = positive_usize
+    )]
+    pub max_line_bytes: usize,
     /// Also print rule warnings
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+fn positive_usize(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[derive(Default)]
@@ -116,7 +136,7 @@ pub fn run(args: HuntArgs) -> u8 {
     let pipelines = match PipelineSet::load(&args.pipelines) {
         Ok(p) => p,
         Err(d) => {
-            eprintln!("{d}");
+            eprintln!("{}", sanitize(&d.to_string()));
             return exit::RULE_ERRORS;
         }
     };
@@ -168,6 +188,11 @@ fn warn_regex_limits(evaluator: &Evaluator) {
 /// Exit-code precedence when several conditions hold: 4 > 3 > 2 > 1 > 0.
 /// Unreadable inputs always give 3; malformed records give 3 only with
 /// `--strict` (or past `--max-errors`); `--fail-on-match` (1) loses to both.
+///
+/// Two cases sit outside that ordering. Exit 2 (rule or usage errors) is returned by
+/// `run` before any input is scanned, so it never competes with 3 or 1. A broken
+/// output pipe returns 0 immediately, mid-scan, and skips the remaining inputs and
+/// every other condition (so it also hides 3 and 1).
 fn scan(
     args: &HuntArgs,
     evaluator: &Evaluator,
@@ -196,14 +221,21 @@ fn scan(
             match &input {
                 None => (
                     "<stdin>".to_string(),
-                    Ok(read_json_events(io::stdin().lock())),
+                    Ok(read_json_events_with_limits(
+                        io::stdin().lock(),
+                        args.max_line_bytes,
+                        MAX_ARRAY_BYTES,
+                    )),
                 ),
-                Some(p) => (p.display().to_string(), open_path(p)),
+                Some(p) => (
+                    p.display().to_string(),
+                    open_path_with_limits(p, args.max_line_bytes, MAX_ARRAY_BYTES),
+                ),
             };
         let events = match events {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("error: {name}: {e}");
+                eprintln!("error: {}: {}", sanitize(&name), sanitize(&e.to_string()));
                 stats.open_errors += 1;
                 continue;
             }
@@ -212,14 +244,19 @@ fn scan(
             let event = match item {
                 Ok(ev) => ev,
                 Err(e) if e.fatal => {
-                    eprintln!("error: {name}: {}", e.message);
+                    let shown = sanitize(&name);
+                    if e.line > 0 {
+                        eprintln!("error: {shown}:{}: {}", e.line, e.message);
+                    } else {
+                        eprintln!("error: {shown}: {}", e.message);
+                    }
                     stats.open_errors += 1;
                     break;
                 }
                 Err(e) => {
                     stats.input_errors += 1;
                     if stats.input_errors <= 5 {
-                        eprintln!("warning: {name}:{}: {}", e.line, e.message);
+                        eprintln!("warning: {}:{}: {}", sanitize(&name), e.line, e.message);
                     }
                     if stats.input_errors > args.max_errors {
                         eprintln!(
@@ -243,8 +280,7 @@ fn scan(
             }
             for idx in evaluator.matching_rules(&event) {
                 stats.matches += 1;
-                let finding =
-                    detection_finding(&evaluator.rules()[idx], &event, &name, stats.matches);
+                let finding = detection_finding(&evaluator.rules()[idx], &event, &name);
                 if let Err(e) = sink.write(finding) {
                     return exit::write_failed(e);
                 }
