@@ -48,8 +48,10 @@ pub fn read_json_events<R: BufRead + 'static>(reader: R) -> Box<dyn Iterator<Ite
     read_with_limits(reader, MAX_LINE_BYTES, MAX_ARRAY_BYTES)
 }
 
-/// Reader with caller-chosen caps, for fuzzing/tests; use [`read_json_events`].
-#[doc(hidden)]
+/// Like [`read_json_events`] with caller-chosen caps: `max_line_bytes` for one NDJSON
+/// line and `max_array_bytes` for a whole JSON array input. This is a supported API
+/// (it backs `zaaf hunt --max-line-bytes`); the defaults are [`MAX_LINE_BYTES`] and
+/// [`MAX_ARRAY_BYTES`].
 pub fn read_json_events_with_limits<R: BufRead + 'static>(
     reader: R,
     max_line_bytes: usize,
@@ -221,7 +223,17 @@ impl<R: BufRead> Iterator for Lines<R> {
     }
 }
 
+/// Opens `path` with the default caps.
 pub fn open_path(path: &Path) -> std::io::Result<Box<dyn Iterator<Item = EventResult>>> {
+    open_path_with_limits(path, MAX_LINE_BYTES, MAX_ARRAY_BYTES)
+}
+
+/// Opens `path` with caller-chosen caps; see [`read_json_events_with_limits`].
+pub fn open_path_with_limits(
+    path: &Path,
+    max_line_bytes: usize,
+    max_array_bytes: usize,
+) -> std::io::Result<Box<dyn Iterator<Item = EventResult>>> {
     // Check before opening: on Windows, opening a directory already fails with
     // "Access is denied", which would hide the clearer message below.
     if std::fs::metadata(path)?.is_dir() {
@@ -231,7 +243,11 @@ pub fn open_path(path: &Path) -> std::io::Result<Box<dyn Iterator<Item = EventRe
         ));
     }
     let file = File::open(path)?;
-    Ok(read_json_events(BufReader::new(file)))
+    Ok(read_json_events_with_limits(
+        BufReader::new(file),
+        max_line_bytes,
+        max_array_bytes,
+    ))
 }
 
 #[cfg(test)]

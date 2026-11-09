@@ -365,3 +365,44 @@ fn invalid_json_array_input_is_unreadable_and_exits_three() {
         .code(3)
         .stderr(predicate::str::contains("1 unreadable inputs"));
 }
+
+#[test]
+fn max_line_bytes_flag_sets_the_ndjson_line_cap() {
+    let dir = setup();
+    let long = format!(
+        "{{\"CommandLine\": \"whoami {}\"}}\n{{\"CommandLine\": \"cmd /c whoami\"}}\n",
+        "x".repeat(300)
+    );
+    fs::write(dir.path().join("long.ndjson"), long).unwrap();
+    let run = |extra: &[&str]| {
+        zaaf()
+            .arg("hunt")
+            .arg("-r")
+            .arg(dir.path().join("rules"))
+            .args(["-o", "ndjson"])
+            .args(extra)
+            .arg(dir.path().join("long.ndjson"))
+            .output()
+            .unwrap()
+    };
+    let default = run(&[]);
+    let stderr = String::from_utf8(default.stderr).unwrap();
+    assert!(stderr.contains("2 events, 0 malformed records"), "{stderr}");
+    let capped = run(&["--max-line-bytes", "100"]);
+    let stderr = String::from_utf8(capped.stderr).unwrap();
+    assert!(
+        stderr.contains("long.ndjson:1: line exceeds 100 bytes"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 events, 1 malformed records"), "{stderr}");
+    assert_eq!(capped.status.code(), Some(0));
+}
+
+#[test]
+fn max_line_bytes_must_be_positive() {
+    let dir = setup();
+    hunt(dir.path())
+        .args(["--max-line-bytes", "0"])
+        .assert()
+        .code(2);
+}

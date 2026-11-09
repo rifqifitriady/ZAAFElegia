@@ -9,7 +9,10 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use zaaf_eval::Evaluator;
 use zaaf_event::Event;
-use zaaf_input::{EventResult, open_path, read_json_events};
+use zaaf_input::{
+    EventResult, MAX_ARRAY_BYTES, MAX_LINE_BYTES, open_path_with_limits,
+    read_json_events_with_limits,
+};
 use zaaf_ir::{CompiledRule, Level};
 use zaaf_pipeline::PipelineSet;
 
@@ -70,9 +73,24 @@ pub struct HuntArgs {
     /// Abort after this many malformed records (exit 3)
     #[arg(long, default_value_t = 1000)]
     pub max_errors: usize,
+    /// Longest accepted NDJSON line in bytes; longer lines are malformed records
+    #[arg(
+        long,
+        default_value_t = MAX_LINE_BYTES,
+        value_parser = positive_usize
+    )]
+    pub max_line_bytes: usize,
     /// Also print rule warnings
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+fn positive_usize(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[derive(Default)]
@@ -203,9 +221,16 @@ fn scan(
             match &input {
                 None => (
                     "<stdin>".to_string(),
-                    Ok(read_json_events(io::stdin().lock())),
+                    Ok(read_json_events_with_limits(
+                        io::stdin().lock(),
+                        args.max_line_bytes,
+                        MAX_ARRAY_BYTES,
+                    )),
                 ),
-                Some(p) => (p.display().to_string(), open_path(p)),
+                Some(p) => (
+                    p.display().to_string(),
+                    open_path_with_limits(p, args.max_line_bytes, MAX_ARRAY_BYTES),
+                ),
             };
         let events = match events {
             Ok(e) => e,

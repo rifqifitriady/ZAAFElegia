@@ -189,7 +189,8 @@ A broken output pipe (for example `zaaf hunt ... | head`) exits 0.
 <details>
 <summary><b>Input</b></summary>
 
-`zaaf hunt` reads NDJSON, a JSON array, or stdin. NDJSON lines over 8 MiB and JSON arrays
+`zaaf hunt` reads NDJSON, a JSON array, or stdin. NDJSON lines over 8 MiB (change it with
+`--max-line-bytes <N>`) and JSON arrays
 over 256 MiB are reported as input errors. An oversized NDJSON line counts as a malformed
 record, so it exits 3 only with `--strict` or above `--max-errors`. JSON arrays are buffered in memory in full, so
 prefer NDJSON for large inputs.
