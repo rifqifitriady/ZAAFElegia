@@ -385,19 +385,24 @@ pub(crate) fn compile_detection(
         ids.push((sid.name.clone(), expr, cost));
     }
     let mut used = 0usize;
-    let conditions = det
-        .conditions
-        .iter()
-        .map(|c| resolve(c, &ids, &mut used))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|message| Problem {
-            location: Location::at(
-                det.condition_line,
-                det.condition_col,
-                format!("{base}.condition"),
-            ),
-            message,
-        })?;
+    let mut conditions = Vec::new();
+    for (i, c) in det.conditions.iter().enumerate() {
+        match resolve(c, &ids, &mut used) {
+            Ok(e) => conditions.push(e),
+            Err(message) => {
+                // Point at the failing entry of a condition list, not at the first one.
+                let (line, col) = det
+                    .condition_positions
+                    .get(i)
+                    .copied()
+                    .unwrap_or((det.condition_line, det.condition_col));
+                return Err(Problem {
+                    location: Location::at(line, col, format!("{base}.condition")),
+                    message,
+                });
+            }
+        }
+    }
     Ok(or(conditions))
 }
 
@@ -657,6 +662,18 @@ mod tests {
         );
         let out = compile_src(&src, &PipelineSet::default());
         assert_eq!(first_error_location(&out), Location::at(10, 1, ""));
+    }
+
+    #[test]
+    fn condition_list_errors_point_at_the_failing_entry() {
+        let out = compile_detection_src(
+            "    s:\n        X: a\n    condition:\n        - s\n        - s and missing\n",
+        );
+        assert_eq!(
+            first_error_location(&out),
+            Location::at(10, 11, "detection.condition")
+        );
+        assert!(first_error(&out).contains("missing"));
     }
 
     #[test]
