@@ -1,0 +1,7 @@
+title: fieldref endswith
+id: c018-ends
+logsource: {product: test}
+detection:
+    s:
+        Cmd2|fieldref|endswith: Tail
+    condition: s
