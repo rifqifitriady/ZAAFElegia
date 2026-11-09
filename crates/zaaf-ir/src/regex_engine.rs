@@ -49,6 +49,17 @@ enum Engine {
     Backtracking(fancy_regex::Regex),
 }
 
+/// Read-only handle on a regex's backtrack-limit hit counter (see [`CompiledRegex::limit_counter`]).
+#[derive(Debug, Clone)]
+pub struct LimitCounter(Arc<AtomicU64>);
+
+impl LimitCounter {
+    /// Hits so far.
+    pub fn hits(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub struct CompiledRegex {
     source: String,
@@ -172,6 +183,11 @@ impl CompiledRegex {
             limit_hits: Arc::default(),
             ..self.clone()
         }
+    }
+
+    /// A handle on the shared hit counter, for reading it without the regex.
+    pub fn limit_counter(&self) -> LimitCounter {
+        LimitCounter(Arc::clone(&self.limit_hits))
     }
 
     /// Identity of the shared hit counter: clones report the same id.

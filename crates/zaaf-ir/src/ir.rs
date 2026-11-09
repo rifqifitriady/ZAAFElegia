@@ -1,6 +1,6 @@
 //! The intermediate representation shared by every evaluator.
 
-use crate::regex_engine::CompiledRegex;
+use crate::regex_engine::{CompiledRegex, LimitCounter};
 use std::collections::HashMap;
 use zaaf_sigma::SigmaString;
 
@@ -20,6 +20,27 @@ impl Expr {
         let mut seen = HashMap::new();
         self.collect_hits(&mut seen);
         seen.values().sum()
+    }
+
+    /// Handles on the distinct hit counters of every regex in the expression (clones of one
+    /// regex share a counter and appear once). Summing their `hits()` equals `regex_limit_hits`.
+    pub fn regex_counters(&self) -> Vec<LimitCounter> {
+        let mut seen = HashMap::new();
+        self.collect_counters(&mut seen);
+        seen.into_values().collect()
+    }
+
+    fn collect_counters(&self, seen: &mut HashMap<usize, LimitCounter>) {
+        match self {
+            Expr::And(v) | Expr::Or(v) => v.iter().for_each(|e| e.collect_counters(seen)),
+            Expr::Not(e) => e.collect_counters(seen),
+            Expr::Pred(p) => {
+                if let Matcher::Regex(re) = &p.matcher {
+                    seen.entry(re.counter_id())
+                        .or_insert_with(|| re.limit_counter());
+                }
+            }
+        }
     }
 
     /// Deep copy in which every regex has its own zeroed limit-hit counter.
@@ -154,6 +175,28 @@ mod tests {
         assert!(expected >= 2);
         let e = Expr::Or(vec![pred(a), Expr::Not(Box::new(pred(b)))]);
         assert_eq!(e.regex_limit_hits(), expected);
+    }
+
+    #[test]
+    fn regex_counters_are_distinct_and_sum_to_regex_limit_hits() {
+        let mk = || {
+            CompiledRegex::with_backtrack_limit(r"^(a|a)*\1$", RegexFlags::default(), 10).unwrap()
+        };
+        let (a, b) = (mk(), mk());
+        let e = Expr::Or(vec![
+            pred(a.clone()),
+            pred(a.clone()),
+            Expr::Not(Box::new(pred(b.clone()))),
+        ]);
+        let counters = e.regex_counters();
+        assert_eq!(counters.len(), 2);
+        let text = format!("{}b", "a".repeat(200));
+        assert!(!a.is_match(&text));
+        assert!(!b.is_match(&text));
+        assert!(!b.is_match(&text));
+        let summed: u64 = counters.iter().map(|c| c.hits()).sum();
+        assert!(summed >= 3);
+        assert_eq!(summed, e.regex_limit_hits());
     }
 
     #[test]

@@ -462,7 +462,8 @@ fn logsource_mismatch(filter: &LogSource, rule: &LogSource) -> Option<String> {
             (!same).then(|| {
                 format!(
                     "{name}: filter `{f}`, rule {}",
-                    r.as_deref().map_or("unset".to_string(), |r| format!("`{r}`"))
+                    r.as_deref()
+                        .map_or("unset".to_string(), |r| format!("`{r}`"))
                 )
             })
         })
@@ -1207,7 +1208,10 @@ mod tests {
         assert_eq!(out.rules.len(), 1);
         let w = warnings_of(&out);
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("filter `f`") && w[0].contains("logsource"), "{w:?}");
+        assert!(
+            w[0].contains("filter `f`") && w[0].contains("logsource"),
+            "{w:?}"
+        );
         assert!(w[0].contains("rule `t`"), "{w:?}");
     }
 
@@ -1253,7 +1257,10 @@ mod tests {
         );
         let w = warnings_of(&out);
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("`Other`") && w[0].contains("not mapped"), "{w:?}");
+        assert!(
+            w[0].contains("`Other`") && w[0].contains("not mapped"),
+            "{w:?}"
+        );
         // a mapped fieldref target does not warn
         let out = compile_src(
             &rule_with("    s:\n        Image|fieldref: Image\n    condition: s\n"),

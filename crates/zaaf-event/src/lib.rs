@@ -148,8 +148,7 @@ fn lookup<'a>(v: &'a Value, rest: Option<&str>, found: &mut Vec<&'a Value>) -> b
     match v {
         Value::Object(map) => {
             // Longest prefix first: the whole of `rest`, then each `.` from the right.
-            let ends =
-                std::iter::once(rest.len()).chain(rest.rmatch_indices('.').map(|(i, _)| i));
+            let ends = std::iter::once(rest.len()).chain(rest.rmatch_indices('.').map(|(i, _)| i));
             for end in ends {
                 if let Some(child) = map.get(&rest[..end]) {
                     let next = rest.get(end + 1..);
@@ -322,7 +321,15 @@ mod tests {
 
     #[test]
     fn as_f64_rejects_non_finite_text() {
-        for s in ["inf", "-inf", "infinity", "-Infinity", "nan", "NaN", "1e999"] {
+        for s in [
+            "inf",
+            "-inf",
+            "infinity",
+            "-Infinity",
+            "nan",
+            "NaN",
+            "1e999",
+        ] {
             assert_eq!(FieldValue::Str(s).as_f64(), None, "{s}");
         }
         assert_eq!(FieldValue::Float(f64::NAN).as_f64(), None);
@@ -331,7 +338,14 @@ mod tests {
 
     #[test]
     fn hostile_epoch_values_do_not_panic() {
-        for s in ["NaN", "inf", "-inf", "1e308", "-1e308", "99999999999999999999"] {
+        for s in [
+            "NaN",
+            "inf",
+            "-inf",
+            "1e308",
+            "-1e308",
+            "99999999999999999999",
+        ] {
             assert!(parse_timestamp(s).is_none(), "{s}");
         }
         assert!(timestamp_from_epoch(f64::NAN).is_none());
