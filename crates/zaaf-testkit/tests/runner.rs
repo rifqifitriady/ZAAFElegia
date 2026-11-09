@@ -22,6 +22,18 @@ fn write_case(expected: &str) -> tempfile::TempDir {
 }
 
 #[test]
+fn rule_file_extensions_are_case_insensitive() {
+    let dir = write_case("  - [r]\n  - []\n");
+    fs::rename(
+        dir.path().join("rules/r.yml"),
+        dir.path().join("rules/R.YML"),
+    )
+    .unwrap();
+    let result = zaaf_testkit::run_case(dir.path());
+    assert!(result.passed(), "{:?}", result.failures);
+}
+
+#[test]
 fn passing_case_passes() {
     let dir = write_case("  - [r]\n  - []\n");
     let result = zaaf_testkit::run_case(dir.path());
