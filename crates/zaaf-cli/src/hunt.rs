@@ -136,7 +136,7 @@ pub fn run(args: HuntArgs) -> u8 {
     let pipelines = match PipelineSet::load(&args.pipelines) {
         Ok(p) => p,
         Err(d) => {
-            eprintln!("{d}");
+            eprintln!("{}", sanitize(&d.to_string()));
             return exit::RULE_ERRORS;
         }
     };
@@ -235,7 +235,7 @@ fn scan(
         let events = match events {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("error: {name}: {e}");
+                eprintln!("error: {}: {}", sanitize(&name), sanitize(&e.to_string()));
                 stats.open_errors += 1;
                 continue;
             }
@@ -244,14 +244,19 @@ fn scan(
             let event = match item {
                 Ok(ev) => ev,
                 Err(e) if e.fatal => {
-                    eprintln!("error: {name}: {}", e.message);
+                    let shown = sanitize(&name);
+                    if e.line > 0 {
+                        eprintln!("error: {shown}:{}: {}", e.line, e.message);
+                    } else {
+                        eprintln!("error: {shown}: {}", e.message);
+                    }
                     stats.open_errors += 1;
                     break;
                 }
                 Err(e) => {
                     stats.input_errors += 1;
                     if stats.input_errors <= 5 {
-                        eprintln!("warning: {name}:{}: {}", e.line, e.message);
+                        eprintln!("warning: {}:{}: {}", sanitize(&name), e.line, e.message);
                     }
                     if stats.input_errors > args.max_errors {
                         eprintln!(

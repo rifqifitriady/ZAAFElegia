@@ -427,6 +427,24 @@ fn json_array_streams_events_before_a_broken_element() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("r-whoami"), "{stdout}");
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(stderr.contains("arr.json: invalid JSON array"), "{stderr}");
+    assert!(
+        stderr.contains("arr.json:3: invalid JSON array"),
+        "{stderr}"
+    );
     assert!(stderr.contains("1 events"), "{stderr}");
+}
+
+#[test]
+fn invalid_json_array_error_carries_its_line_number() {
+    let dir = setup();
+    fs::write(
+        dir.path().join("b.json"),
+        "[\n{\"CommandLine\": \"a\"},\n{\"CommandLine\": }\n]",
+    )
+    .unwrap();
+    hunt(dir.path())
+        .arg(dir.path().join("b.json"))
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("b.json:3: invalid JSON array: "));
 }

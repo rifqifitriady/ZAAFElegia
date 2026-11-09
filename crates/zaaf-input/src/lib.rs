@@ -78,7 +78,7 @@ fn read_with_limits<R: BufRead + 'static>(
                 if bom_seen < BOM.len() && buf[0] == BOM[bom_seen] {
                     (1, None, 0, true)
                 } else {
-                    match buf.iter().position(|b| !b.is_ascii_whitespace()) {
+                    match buf.iter().position(|b| !is_json_ws(*b)) {
                         Some(pos) => (
                             pos,
                             Some(buf[pos]),
@@ -115,6 +115,11 @@ fn read_with_limits<R: BufRead + 'static>(
             buf: Vec::new(),
         }),
     }
+}
+
+/// JSON whitespace: space, tab, LF, CR only (not form feed or vertical tab).
+fn is_json_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
 /// Where the array reader is in the document.
@@ -186,6 +191,23 @@ impl<R: BufRead> ArrayItems<R> {
         }))
     }
 
+    /// Serde's real error for a half-read element (EOF or cap reached with bytes
+    /// buffered), at its absolute line. `None` when serde itself only hits end of input.
+    fn buffered_error(&self) -> Option<(usize, String)> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let e = serde_json::from_slice::<Value>(&self.buf).err()?;
+        if e.classify() == serde_json::error::Category::Eof {
+            return None;
+        }
+        let text = e.to_string();
+        let text = text
+            .rsplit_once(" at line ")
+            .map_or(text.as_str(), |(m, _)| m);
+        Some((self.elem_line + e.line() - 1, text.to_string()))
+    }
+
     /// Parses the finished element in `buf` and resets the per-element state.
     fn finish_element(&mut self) -> ArrayStep {
         let parsed = serde_json::from_slice::<Value>(&self.buf);
@@ -229,6 +251,9 @@ impl<R: BufRead> Iterator for ArrayItems<R> {
                     self.state = ArrayState::Done;
                     return None;
                 }
+                if let Some((line, m)) = self.buffered_error() {
+                    return self.fatal(line, format!("invalid JSON array: {m}"));
+                }
                 let line = self.line;
                 return self.fatal(
                     line,
@@ -246,7 +271,7 @@ impl<R: BufRead> Iterator for ArrayItems<R> {
                 }
                 let newline = b == b'\n';
                 if self.state == ArrayState::Trailing {
-                    if !b.is_ascii_whitespace() {
+                    if !is_json_ws(b) {
                         step = Some(ArrayStep::Fail(
                             self.line,
                             "trailing characters after the array".to_string(),
@@ -262,7 +287,7 @@ impl<R: BufRead> Iterator for ArrayItems<R> {
                     } else if b == b'"' {
                         self.in_string = false;
                     }
-                } else if self.buf.is_empty() && b.is_ascii_whitespace() {
+                } else if self.buf.is_empty() && is_json_ws(b) {
                     // Whitespace before an element.
                 } else if self.depth == 0 && (b == b',' || b == b']') {
                     if self.buf.is_empty() {
@@ -305,6 +330,9 @@ impl<R: BufRead> Iterator for ArrayItems<R> {
             match step {
                 Some(ArrayStep::Item(v)) => return Some(Ok(JsonEvent::new(v))),
                 Some(ArrayStep::Cap) => {
+                    if let Some((line, m)) = self.buffered_error() {
+                        return self.fatal(line, format!("invalid JSON array: {m}"));
+                    }
                     let line = self.line;
                     let message = format!(
                         "JSON array input exceeds {} bytes; use NDJSON for large inputs",
@@ -549,6 +577,33 @@ mod tests {
         );
         // Trailing whitespace after `]` counts too.
         assert!(read_lim(b"[1]    ", 1024, 5).last().unwrap().is_err());
+    }
+
+    #[test]
+    fn array_fatal_errors_use_serdes_error_at_the_absolute_line() {
+        // Bad token mid-element.
+        let items = read("[1,\n2,\n{\"a\": 1, 5: 2}\n]");
+        let e = items.last().unwrap().as_ref().unwrap_err();
+        assert!(e.fatal);
+        assert_eq!(e.line, 3);
+        assert!(e.message.contains("key must be a string"), "{}", e.message);
+        // Unbalanced quote: the splitter reads to EOF, serde still finds the real error.
+        let items = read("[1,\n2,\n{'a\": 1}\n,3]");
+        let e = items.last().unwrap().as_ref().unwrap_err();
+        assert!(e.fatal);
+        assert_eq!(e.line, 3);
+        assert!(!e.message.contains("end of input"), "{}", e.message);
+        // Genuine truncation still reports end of input.
+        let items = read("[1,\n{\"a\": ");
+        let e = items.last().unwrap().as_ref().unwrap_err();
+        assert!(e.message.contains("end of input"), "{}", e.message);
+    }
+
+    #[test]
+    fn form_feed_is_not_json_whitespace() {
+        assert!(read("[\x0c1]").last().unwrap().is_err());
+        assert!(read("[1]\x0c").last().unwrap().is_err());
+        assert!(read("[ 1,\t2\r\n]\n").iter().all(Result::is_ok));
     }
 
     #[test]
