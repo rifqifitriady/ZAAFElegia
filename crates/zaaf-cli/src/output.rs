@@ -29,8 +29,15 @@ fn severity_name(level: Level) -> &'static str {
 
 /// One OCSF Detection Finding per (rule, event) match. `author` and `references`
 /// are always included (DRL 1.1 attribution).
-pub fn detection_finding(rule: &CompiledRule, event: &dyn Event, source: &str, seq: u64) -> Value {
+///
+/// `finding_info.uid` is `{rule_id}:{hash}`, where `hash` is 16 hex digits of an
+/// FNV-1a 64-bit hash of the event's canonical JSON (object keys sorted). It is
+/// deterministic across runs, inputs and key order, so the same rule matching the same
+/// event content always gets the same uid. It is an identifier, not a cryptographic
+/// digest, and identical events (even from different files) share a uid.
+pub fn detection_finding(rule: &CompiledRule, event: &dyn Event, source: &str) -> Value {
     let info = &rule.info;
+    let evidence = event.to_json();
     let time = event
         .timestamp()
         .unwrap_or_else(Utc::now)
@@ -50,7 +57,7 @@ pub fn detection_finding(rule: &CompiledRule, event: &dyn Event, source: &str, s
         "time": time,
         "message": info.title,
         "finding_info": {
-            "uid": format!("{}:{seq}", info.id),
+            "uid": format!("{}:{:016x}", info.id, event_hash(&evidence)),
             "title": info.title,
             "desc": info.description,
             "types": info.tags,
@@ -64,7 +71,7 @@ pub fn detection_finding(rule: &CompiledRule, event: &dyn Event, source: &str, s
                 "version": env!("CARGO_PKG_VERSION")
             }
         },
-        "evidences": [ { "data": event.to_json() } ],
+        "evidences": [ { "data": evidence } ],
         "unmapped": {
             "source": source,
             "sigma": {
@@ -81,6 +88,48 @@ pub fn detection_finding(rule: &CompiledRule, event: &dyn Event, source: &str, s
                 "rule_file": info.source.as_ref().map(|p| p.display().to_string())
             }
         }
+    })
+}
+
+/// Appends `v` as JSON with object keys sorted, so equal values hash equally whatever
+/// their key order (the workspace enables serde_json's `preserve_order`).
+fn canonical_json(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::Array(a) => {
+            out.push(b'[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                canonical_json(x, out);
+            }
+            out.push(b']');
+        }
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            out.push(b'{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(Value::String(k.clone()).to_string().as_bytes());
+                out.push(b':');
+                canonical_json(&m[k], out);
+            }
+            out.push(b'}');
+        }
+        scalar => out.extend_from_slice(scalar.to_string().as_bytes()),
+    }
+}
+
+/// FNV-1a 64-bit hash of the event's canonical JSON. Hand-rolled because it must stay
+/// stable across Rust releases (`DefaultHasher` makes no such promise).
+fn event_hash(event: &Value) -> u64 {
+    let mut bytes = Vec::new();
+    canonical_json(event, &mut bytes);
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
@@ -255,11 +304,11 @@ mod tests {
     #[test]
     fn finding_has_ocsf_core_fields_and_attribution() {
         let ev = JsonEvent::new(serde_json::json!({"@timestamp": "2026-11-07T03:15:00Z"}));
-        let f = detection_finding(&rule(), &ev, "a.ndjson", 7);
+        let f = detection_finding(&rule(), &ev, "a.ndjson");
         assert_eq!(f["class_uid"], 2004);
         assert_eq!(f["type_uid"], 200401);
         assert_eq!(f["severity_id"], 4);
-        assert_eq!(f["finding_info"]["uid"], "r1:7");
+        assert_eq!(f["finding_info"]["uid"], "r1:8ba72a9f57120243");
         assert_eq!(f["finding_info"]["analytic"]["uid"], "r1");
         assert_eq!(f["unmapped"]["sigma"]["author"], "Ann");
         assert_eq!(f["unmapped"]["sigma"]["references"][0], "https://x");
@@ -268,12 +317,38 @@ mod tests {
     }
 
     #[test]
+    fn uid_is_deterministic_and_content_based() {
+        let uid = |v: serde_json::Value| {
+            detection_finding(&rule(), &JsonEvent::new(v), "s")["finding_info"]["uid"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let a = uid(serde_json::json!({"x": 1, "y": {"b": [1, 2], "a": "q"}}));
+        // Same content, different key order, same uid.
+        assert_eq!(
+            a,
+            uid(serde_json::json!({"y": {"a": "q", "b": [1, 2]}, "x": 1}))
+        );
+        assert_ne!(
+            a,
+            uid(serde_json::json!({"x": 2, "y": {"b": [1, 2], "a": "q"}}))
+        );
+        assert_ne!(
+            a,
+            uid(serde_json::json!({"x": 1, "y": {"b": [2, 1], "a": "q"}}))
+        );
+        // Pinned so the uid stays stable across releases.
+        assert_eq!(uid(serde_json::json!({})), "r1:08f44b07b5901a25");
+    }
+
+    #[test]
     fn csv_has_header_and_escapes() {
         let ev = JsonEvent::new(serde_json::json!({}));
         let mut buf = Vec::new();
         {
             let mut sink = Sink::new(OutputFormat::Csv, &mut buf);
-            sink.write(detection_finding(&rule(), &ev, "s", 1)).unwrap();
+            sink.write(detection_finding(&rule(), &ev, "s")).unwrap();
             sink.finish().unwrap();
         }
         let text = String::from_utf8(buf).unwrap();
@@ -305,7 +380,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut sink = Sink::new(OutputFormat::Csv, &mut buf);
-            sink.write(detection_finding(&r, &ev, "s", 1)).unwrap();
+            sink.write(detection_finding(&r, &ev, "s")).unwrap();
             sink.finish().unwrap();
         }
         let text = String::from_utf8(buf).unwrap();
@@ -345,7 +420,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut sink = Sink::new(OutputFormat::Table, &mut buf);
-            sink.write(detection_finding(&rule(), &ev, "s", 1)).unwrap();
+            sink.write(detection_finding(&rule(), &ev, "s")).unwrap();
             sink.finish().unwrap();
         }
         let text = String::from_utf8(buf).unwrap();
@@ -358,8 +433,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut sink = Sink::new(OutputFormat::Json, &mut buf);
-            sink.write(detection_finding(&rule(), &ev, "s", 1)).unwrap();
-            sink.write(detection_finding(&rule(), &ev, "s", 2)).unwrap();
+            sink.write(detection_finding(&rule(), &ev, "s")).unwrap();
+            sink.write(detection_finding(&rule(), &ev, "s")).unwrap();
             sink.finish().unwrap();
         }
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();

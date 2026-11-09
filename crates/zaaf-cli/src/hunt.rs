@@ -250,8 +250,7 @@ fn scan(
             }
             for idx in evaluator.matching_rules(&event) {
                 stats.matches += 1;
-                let finding =
-                    detection_finding(&evaluator.rules()[idx], &event, &name, stats.matches);
+                let finding = detection_finding(&evaluator.rules()[idx], &event, &name);
                 if let Err(e) = sink.write(finding) {
                     return exit::write_failed(e);
                 }

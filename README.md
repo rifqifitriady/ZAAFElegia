@@ -119,6 +119,10 @@ An excerpt of real `zaaf hunt -o ndjson` output for a rule that matches an encod
 }
 ```
 
+`finding_info.uid` is `<rule id>:<16 hex digits>`, a hash of the matched event's canonical JSON
+(keys sorted), so the same rule matching the same event gives the same uid on every run. It is an
+identifier, not a cryptographic digest.
+
 ## Proof, not promises
 
 Three things you can check yourself:
