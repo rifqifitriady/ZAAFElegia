@@ -147,52 +147,87 @@ impl SigmaString {
     }
 }
 
-/// Iterative wildcard matching with single-star backtracking (linear memory).
-fn glob(toks: &[Tok], text: &str) -> bool {
-    #[derive(Clone, Copy)]
-    enum P {
-        C(char),
-        One,
-        Many,
-    }
-    let pat: Vec<P> = toks
-        .iter()
-        .flat_map(|t| match t {
-            Tok::Lit(s) => s.chars().map(P::C).collect::<Vec<_>>(),
-            Tok::AnyOne => vec![P::One],
-            Tok::AnyMany => vec![P::Many],
-        })
-        .collect();
-    let txt: Vec<char> = text.chars().collect();
-    let (mut p, mut t) = (0usize, 0usize);
-    let mut star: Option<usize> = None;
-    let mut mark = 0usize;
-    while t < txt.len() {
-        let step = p < pat.len()
-            && match pat[p] {
-                P::C(c) => c == txt[t],
-                P::One => true,
-                P::Many => false,
+/// A cursor into a token list: token index and byte offset inside a `Lit`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cur {
+    tok: usize,
+    off: usize,
+}
+
+/// One pattern element at a cursor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum P {
+    C(char),
+    One,
+    Many,
+}
+
+/// The pattern element at `cur` and the cursor after it; `None` at the end.
+fn peek(toks: &[Tok], cur: Cur) -> Option<(P, Cur)> {
+    match toks.get(cur.tok)? {
+        Tok::AnyOne => Some((
+            P::One,
+            Cur {
+                tok: cur.tok + 1,
+                off: 0,
+            },
+        )),
+        Tok::AnyMany => Some((
+            P::Many,
+            Cur {
+                tok: cur.tok + 1,
+                off: 0,
+            },
+        )),
+        Tok::Lit(s) => {
+            let c = s[cur.off..].chars().next()?;
+            let off = cur.off + c.len_utf8();
+            let next = if off >= s.len() {
+                Cur {
+                    tok: cur.tok + 1,
+                    off: 0,
+                }
+            } else {
+                Cur { tok: cur.tok, off }
             };
-        if step {
-            p += 1;
-            t += 1;
-        } else if p < pat.len() && matches!(pat[p], P::Many) {
-            star = Some(p);
+            Some((P::C(c), next))
+        }
+    }
+}
+
+/// Iterative wildcard matching with single-star backtracking. Walks the tokens and the
+/// text in place (byte cursors), so it never allocates.
+fn glob(toks: &[Tok], text: &str) -> bool {
+    let mut p = Cur { tok: 0, off: 0 };
+    let mut t = 0usize;
+    let mut star: Option<Cur> = None;
+    let mut mark = 0usize;
+    while let Some(tc) = text[t..].chars().next() {
+        let cur = peek(toks, p);
+        let step = match cur {
+            Some((P::C(c), next)) if c == tc => Some(next),
+            Some((P::One, next)) => Some(next),
+            _ => None,
+        };
+        if let Some(next) = step {
+            p = next;
+            t += tc.len_utf8();
+        } else if let Some((P::Many, next)) = cur {
+            star = Some(next);
             mark = t;
-            p += 1;
+            p = next;
         } else if let Some(s) = star {
-            p = s + 1;
-            mark += 1;
+            p = s;
+            mark += text[mark..].chars().next().map_or(1, char::len_utf8);
             t = mark;
         } else {
             return false;
         }
     }
-    while p < pat.len() && matches!(pat[p], P::Many) {
-        p += 1;
+    while let Some((P::Many, next)) = peek(toks, p) {
+        p = next;
     }
-    p == pat.len()
+    peek(toks, p).is_none()
 }
 
 #[cfg(test)]
@@ -249,6 +284,124 @@ mod tests {
         assert!(!m("a*c*e", "abcdef"));
         assert!(m("*a*a*a*", "xaxaxax"));
         assert!(m("?", "é"));
+    }
+
+    /// The previous allocating implementation, kept as the behavioural reference.
+    fn glob_reference(toks: &[Tok], text: &str) -> bool {
+        let pat: Vec<P> = toks
+            .iter()
+            .flat_map(|t| match t {
+                Tok::Lit(s) => s.chars().map(P::C).collect::<Vec<_>>(),
+                Tok::AnyOne => vec![P::One],
+                Tok::AnyMany => vec![P::Many],
+            })
+            .collect();
+        let txt: Vec<char> = text.chars().collect();
+        let (mut p, mut t) = (0usize, 0usize);
+        let mut star: Option<usize> = None;
+        let mut mark = 0usize;
+        while t < txt.len() {
+            let step = p < pat.len()
+                && match pat[p] {
+                    P::C(c) => c == txt[t],
+                    P::One => true,
+                    P::Many => false,
+                };
+            if step {
+                p += 1;
+                t += 1;
+            } else if p < pat.len() && pat[p] == P::Many {
+                star = Some(p);
+                mark = t;
+                p += 1;
+            } else if let Some(s) = star {
+                p = s + 1;
+                mark += 1;
+                t = mark;
+            } else {
+                return false;
+            }
+        }
+        while p < pat.len() && pat[p] == P::Many {
+            p += 1;
+        }
+        p == pat.len()
+    }
+
+    #[test]
+    fn glob_agrees_with_the_reference_on_all_small_inputs() {
+        // Every pattern of up to 4 elements and every text of up to 5 characters over a
+        // small alphabet that includes multibyte characters.
+        let pat_alphabet = ["a", "é", "日", "?", "*"];
+        let txt_alphabet = ['a', 'b', 'é', '日'];
+        let mut patterns = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for f in &frontier {
+                for a in pat_alphabet {
+                    next.push(format!("{f}{a}"));
+                }
+            }
+            patterns.extend(next.iter().cloned());
+            frontier = next;
+        }
+        let mut texts = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..5 {
+            let mut next = Vec::new();
+            for f in &frontier {
+                for a in txt_alphabet {
+                    next.push(format!("{f}{a}"));
+                }
+            }
+            texts.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for pat in &patterns {
+            let s = SigmaString::parse(pat);
+            for text in &texts {
+                assert_eq!(
+                    glob(s.toks(), text),
+                    glob_reference(s.toks(), text),
+                    "pattern {pat:?} text {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_question_mark_is_literal() {
+        let s = SigmaString::parse(r"a\?b");
+        assert_eq!(s.as_plain().as_deref(), Some("a?b"));
+        assert!(s.matches("a?b"));
+        assert!(!s.matches("axb"));
+        // an escaped backslash followed by a real wildcard
+        let s = SigmaString::parse(r"a\\?b");
+        assert!(s.matches(r"a\xb"));
+        assert!(!s.matches("a?b"));
+    }
+
+    #[test]
+    fn general_glob_with_single_char_wildcard_inside_stars() {
+        let m = |p: &str, t: &str| SigmaString::parse(p).matches(t);
+        assert!(m("*a?b*", "xxaZbyy"));
+        assert!(m("*a?b*", "a b"));
+        assert!(!m("*a?b*", "ab"));
+        assert!(!m("*a?b*", "xxaZZbyy"));
+        assert!(m("*a?b*", "aab"));
+    }
+
+    #[test]
+    fn multibyte_text_with_wildcards() {
+        let m = |p: &str, t: &str| SigmaString::parse(p).matches(t);
+        assert!(m("*é*", "caféteria"));
+        assert!(m("日*本", "日本語本"));
+        assert!(!m("日*本", "日本語"));
+        assert!(m("?é*", "aéz"));
+        assert!(m("*日?", "x日本"));
+        assert!(!m("*日?", "x日"));
+        assert!(m("*本*語*", "日本語"));
     }
 
     #[test]

@@ -192,7 +192,12 @@ pub fn parse_condition(s: &str) -> Result<CondExpr, String> {
     };
     let e = p.expr()?;
     if p.pos != p.toks.len() {
-        return Err(format!("unexpected token after position {}", p.pos));
+        let text = match &p.toks[p.pos] {
+            T::LParen => "(",
+            T::RParen => ")",
+            T::Word(w) => w.as_str(),
+        };
+        return Err(format!("unexpected token `{text}`"));
     }
     Ok(e)
 }
@@ -281,6 +286,33 @@ mod tests {
             parse_condition("not not a").unwrap(),
             CondExpr::Not(Box::new(CondExpr::Not(Box::new(id("a")))))
         );
+    }
+
+    #[test]
+    fn nesting_boundary_is_exactly_64_levels() {
+        let nested = |n: usize| "(".repeat(n) + "a" + &")".repeat(n);
+        assert_eq!(parse_condition(&nested(64)).unwrap(), id("a"));
+        let err = parse_condition(&nested(65)).unwrap_err();
+        assert!(err.contains("nested too deeply"), "{err}");
+
+        let nots = |n: usize| "not ".repeat(n) + "a";
+        assert!(parse_condition(&nots(64)).is_ok());
+        assert!(parse_condition(&nots(65)).is_err());
+    }
+
+    #[test]
+    fn error_messages_name_the_offending_token() {
+        let msg = |s: &str| parse_condition(s).unwrap_err();
+        assert_eq!(msg("(a"), "missing closing parenthesis");
+        assert_eq!(msg("a)"), "unexpected token `)`");
+        assert_eq!(msg("and a"), "unexpected keyword `and`");
+        assert_eq!(msg("a b"), "unexpected token `b`");
+        assert_eq!(msg("a and"), "unexpected end of condition");
+        assert_eq!(
+            msg("1 of"),
+            "`1 of` must be followed by `them` or a pattern"
+        );
+        assert_eq!(msg(""), "empty condition");
     }
 
     #[test]
