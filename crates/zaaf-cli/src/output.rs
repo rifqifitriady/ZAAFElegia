@@ -187,13 +187,24 @@ fn row(f: &Value) -> [String; 7] {
     ]
 }
 
-/// Replaces control characters with visible `\xNN` escapes so rule-controlled text
-/// (table and CSV cells, warnings) cannot inject terminal escape sequences.
+/// Unicode format characters that can reorder or hide text: zero-width and
+/// directional marks (U+200B..U+200F), line/paragraph separators (U+2028/2029),
+/// bidi embeddings/overrides (U+202A..U+202E) and bidi isolates (U+2066..U+2069).
+fn is_invisible_format(c: char) -> bool {
+    matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Replaces control characters with visible `\xNN` escapes, and invisible Unicode
+/// format characters (bidi controls, zero-width characters, U+2028/2029) with
+/// `\u{XXXX}`, so rule-controlled text (table and CSV cells, warnings) cannot inject
+/// terminal escape sequences or visually reorder or hide text.
 pub fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_control() {
                 format!("\\x{:02x}", c as u32)
+            } else if is_invisible_format(c) {
+                format!("\\u{{{:04x}}}", c as u32)
             } else {
                 c.to_string()
             }
@@ -308,6 +319,24 @@ mod tests {
     #[test]
     fn table_cells_escape_control_chars() {
         assert_eq!(sanitize("a\u{1b}[31m\rb\tc é"), "a\\x1b[31m\\x0db\\x09c é");
+    }
+
+    #[test]
+    fn unicode_format_characters_are_escaped() {
+        for c in ('\u{200b}'..='\u{200f}')
+            .chain('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}')
+            .chain(['\u{2028}', '\u{2029}'])
+        {
+            let out = sanitize(&format!("a{c}b"));
+            assert_eq!(
+                out,
+                format!("a\\u{{{:04x}}}b", c as u32),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+        assert_eq!(sanitize("é日本\u{200a}"), "é日本\u{200a}");
     }
 
     #[test]
