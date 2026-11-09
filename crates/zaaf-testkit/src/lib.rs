@@ -68,11 +68,18 @@ pub fn run_suite(root: &Path) -> Result<Vec<CaseResult>, String> {
         .collect())
 }
 
+/// The `.yml`/`.yaml` files directly inside `dir`, sorted. Extension matching is
+/// case-insensitive, like `zaaf check`. Unlike the CLI this is **not recursive**:
+/// a conformance case keeps its rules flat in `rules/`.
 fn yaml_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yml" | "yaml")))
+                .filter(|p| {
+                    p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                        e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml")
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();

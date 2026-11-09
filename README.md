@@ -119,6 +119,10 @@ An excerpt of real `zaaf hunt -o ndjson` output for a rule that matches an encod
 }
 ```
 
+`finding_info.uid` is `<rule id>:<16 hex digits>`, a hash of the matched event's canonical JSON
+(keys sorted), so the same rule matching the same event gives the same uid on every run. It is an
+identifier, not a cryptographic digest.
+
 ## Proof, not promises
 
 Three things you can check yourself:
@@ -173,7 +177,7 @@ The table shows the author but not the references, which are too long for it; us
 |---|---|
 | 0 | Success |
 | 1 | Matches found (only with `--fail-on-match`) |
-| 2 | Usage errors. `zaaf check` exits 2 on any rule error; `zaaf hunt` exits 2 on rule errors only with `--strict`, and also when no rules are left to run |
+| 2 | Usage errors. `zaaf check` exits 2 on any rule error, and also when the given paths contain no rule files at all; `zaaf hunt` exits 2 on rule errors only with `--strict`, and also when no rules are left to run |
 | 3 | Input errors: an unreadable input always (missing file, a directory, or a read error); malformed records (including oversized lines) only with `--strict` or above `--max-errors` |
 | 4 | Internal error |
 
@@ -185,10 +189,12 @@ A broken output pipe (for example `zaaf hunt ... | head`) exits 0.
 <details>
 <summary><b>Input</b></summary>
 
-`zaaf hunt` reads NDJSON, a JSON array, or stdin. NDJSON lines over 8 MiB and JSON arrays
-over 256 MiB are reported as input errors. An oversized NDJSON line counts as a malformed
-record, so it exits 3 only with `--strict` or above `--max-errors`. JSON arrays are buffered in memory in full, so
-prefer NDJSON for large inputs.
+`zaaf hunt` reads NDJSON, a JSON array, or stdin. NDJSON lines over 8 MiB (change it with
+`--max-line-bytes <N>`) are reported as malformed records, so they exit 3 only with `--strict` or
+above `--max-errors`. A JSON array is streamed one element at a time, so memory use does not grow
+with the file; only the largest single element is held. The array as a whole is capped at 256 MiB.
+An invalid array, or one over the cap, makes the input unreadable (exit 3): events before the
+problem have already been processed, and the rest of that input is skipped.
 
 `--from` and `--to` take RFC 3339 timestamps only (for example `2026-11-07T01:00:00Z`); anything
 else, such as a bare year, is a usage error. Events without a detectable timestamp pass the

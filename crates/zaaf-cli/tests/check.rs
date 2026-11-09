@@ -218,17 +218,28 @@ fn duplicate_inputs_are_deduped() {
 }
 
 #[test]
-fn no_rule_files_warns_and_quiet_hides_it() {
+fn no_rule_files_is_an_error_even_when_quiet() {
     let dir = tempfile::tempdir().unwrap();
+    for extra in [None, Some("-q")] {
+        let mut cmd = zaaf();
+        cmd.arg("check");
+        cmd.args(extra);
+        cmd.arg(dir.path())
+            .assert()
+            .code(2)
+            .stdout(predicate::str::contains("no rule files found"));
+    }
+}
+
+#[test]
+fn no_rule_files_among_several_paths_is_fine_when_one_has_rules() {
+    let empty = tempfile::tempdir().unwrap();
+    let good = tempfile::tempdir().unwrap();
+    fs::write(good.path().join("good.yml"), GOOD).unwrap();
     zaaf()
         .arg("check")
-        .arg(dir.path())
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("no rule files found"));
-    zaaf()
-        .args(["check", "-q"])
-        .arg(dir.path())
+        .arg(empty.path())
+        .arg(good.path())
         .assert()
         .success()
         .stdout(predicate::str::contains("no rule files found").not());

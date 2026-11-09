@@ -48,10 +48,8 @@ pub fn collect_rule_files(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<Diagnostic>) 
     let mut seen = HashSet::new();
     files.retain(|f| seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())));
     if files.is_empty() && diags.is_empty() {
-        diags.push(Diagnostic::warning(
-            Location::Unknown,
-            "no rule files found",
-        ));
+        // An error, not a warning: a CI lint pointed at the wrong path must fail.
+        diags.push(Diagnostic::error(Location::Unknown, "no rule files found"));
     }
     (files, diags)
 }
