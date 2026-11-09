@@ -1,6 +1,10 @@
 """Run with: python3 -I scripts/test_compare_known_unsupported.py"""
+import contextlib
+import io
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +58,48 @@ class Tests(unittest.TestCase):
     def test_path_normalisation(self):
         r = report(rules=2, diags=[err("rules\\a.yml")])
         self.assertEqual(c.check(r, c.parse_known(["./rules/a.yml # why"]), 2)[0], 0)
+
+    def test_exact_counts(self):
+        self.assertEqual(c.check(report(), {}, 0, (3, 3))[0], 0)
+        self.assertEqual(c.check(report(), {}, 0, (4, 3))[0], 1)
+        self.assertEqual(c.check(report(), {}, 0, (3, 4))[0], 1)
+
+    def test_validate_report(self):
+        c.validate_report(report())
+        r = report()
+        del r["filters"]
+        with self.assertRaises(c.SchemaError):
+            c.validate_report(r)
+        with self.assertRaises(c.SchemaError):
+            c.validate_report(report(diags=[{"severity": "error"}]))
+        with self.assertRaises(c.SchemaError):
+            c.validate_report([])
+
+    def test_main_schema_error_exits_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            rp, kp = os.path.join(d, "r.json"), os.path.join(d, "k.txt")
+            with open(rp, "w") as fh:
+                json.dump({"files": 1}, fh)
+            open(kp, "w").close()
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(c.main(["x", rp, kp]), 2)
+            self.assertIn("missing keys", err.getvalue())
+            with open(rp, "w") as fh:
+                fh.write("not json")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(c.main(["x", rp, kp]), 2)
+
+    def test_main_expect_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            rp, kp = os.path.join(d, "r.json"), os.path.join(d, "k.txt")
+            with open(rp, "w") as fh:
+                json.dump(report(), fh)
+            open(kp, "w").close()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(c.main(["x", rp, kp, "--expect-counts", "3,3"]), 0)
+                self.assertEqual(c.main(["x", rp, kp, "--expect-counts", "9,9"]), 1)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(c.main(["x", rp, kp, "--expect-counts", "bad"]), 2)
 
     def test_usage(self):
         self.assertEqual(c.main(["x"]), 2)
