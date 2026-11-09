@@ -180,6 +180,9 @@ fn peek(toks: &[Tok], cur: Cur) -> Option<(P, Cur)> {
             },
         )),
         Tok::Lit(s) => {
+            // Invariant: `push_lit` never stores an empty literal, so a `Lit` always
+            // has a character at offset 0 and `None` below only means "end of pattern".
+            debug_assert!(!s.is_empty(), "empty Tok::Lit");
             let c = s[cur.off..].chars().next()?;
             let off = cur.off + c.len_utf8();
             let next = if off >= s.len() {
