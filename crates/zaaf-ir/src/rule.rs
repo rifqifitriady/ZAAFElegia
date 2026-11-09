@@ -193,7 +193,7 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
     // Filters that failed to compile: (title, targeted rule ids/names).
     let mut failed_filters: Vec<(String, Vec<String>)> = Vec::new();
     for (f, source) in filters {
-        if budget.skipped > 0 {
+        if budget.exceeded() {
             budget.skipped += 1;
             continue;
         }
@@ -247,7 +247,7 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
 
     let mut seen = HashSet::new();
     'rules: for (r, source) in rules {
-        if budget.skipped > 0 {
+        if budget.exceeded() {
             budget.skipped += 1;
             continue;
         }
@@ -386,11 +386,13 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
             expr,
         });
     }
-    if let Some((source, location, is_filter)) = budget.first_skip {
-        let what = if is_filter {
-            "this filter and all rules"
-        } else {
-            "this and later rules"
+    if let Some((source, location, is_filter, crossing_skipped)) = budget.first_skip.clone() {
+        let what = match (crossing_skipped, is_filter) {
+            (true, true) => "this filter and all rules",
+            (true, false) => "this and later rules",
+            // The crossing document failed on its own and has its own error.
+            (false, true) => "later filters and all rules",
+            (false, false) => "later rules",
         };
         out.diagnostics.push(error(
             &source,
@@ -402,7 +404,7 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
         ));
     }
     // With rules skipped by the budget a filter may only look unused because its target was dropped.
-    if budget.skipped == 0 {
+    if !budget.exceeded() {
         for f in compiled_filters.iter().filter(|f| !f.used) {
             out.diagnostics.push(warning(
                 &f.source,
@@ -418,15 +420,23 @@ pub fn compile(docs: Vec<SourcedDocument>, pipelines: &PipelineSet) -> CompileOu
 #[derive(Default)]
 struct Budget {
     total: usize,
+    /// Documents skipped uncompiled because of the budget. The crossing document is
+    /// counted only when it was itself skipped, not when it failed with its own error.
     skipped: usize,
-    /// Source, location and whether the crossing document is a filter.
-    first_skip: Option<(Option<PathBuf>, Location, bool)>,
+    /// Source, location, whether the crossing document is a filter, and whether it was
+    /// itself skipped (as opposed to having failed with its own error).
+    first_skip: Option<(Option<PathBuf>, Location, bool, bool)>,
 }
 
 impl Budget {
+    /// Whether the total budget has been crossed; later documents are skipped.
+    fn exceeded(&self) -> bool {
+        self.first_skip.is_some()
+    }
+
     fn skip(&mut self, source: &Option<PathBuf>, location: Location, is_filter: bool) {
         self.skipped = 1;
-        self.first_skip = Some((source.clone(), location, is_filter));
+        self.first_skip = Some((source.clone(), location, is_filter, true));
     }
 
     /// Charges the weight a failed document attempted to build, so hostile text that
@@ -439,15 +449,15 @@ impl Budget {
         is_filter: bool,
     ) {
         self.total = self.total.saturating_add(attempted);
-        if self.total > MAX_TOTAL_WEIGHT && self.skipped == 0 {
-            self.skip(source, location, is_filter);
+        if self.total > MAX_TOTAL_WEIGHT && !self.exceeded() {
+            self.first_skip = Some((source.clone(), location, is_filter, false));
         }
     }
 }
 
 /// Describes how a filter's logsource differs from a rule's, if it does. A part the
 /// filter leaves unspecified never differs; a part it names must equal the rule's
-/// (compared case-insensitively).
+/// (compared case-insensitively, with Unicode lowercasing like pipeline conditions).
 fn logsource_mismatch(filter: &LogSource, rule: &LogSource) -> Option<String> {
     let parts = [
         ("category", &filter.category, &rule.category),
@@ -458,7 +468,8 @@ fn logsource_mismatch(filter: &LogSource, rule: &LogSource) -> Option<String> {
         .into_iter()
         .filter_map(|(name, f, r)| {
             let f = f.as_deref().filter(|s| !s.is_empty())?;
-            let same = r.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(f));
+            let f_lower = f.to_lowercase();
+            let same = r.as_deref().is_some_and(|r| r.to_lowercase() == f_lower);
             (!same).then(|| {
                 format!(
                     "{name}: filter `{f}`, rule {}",
@@ -1216,6 +1227,17 @@ mod tests {
     const FILTER_R1: &str = "---\ntitle: f\nlogsource:\n    product: windows\nfilter:\n    rules: [r1]\n    sel:\n        User: x\n    condition: sel\n";
 
     #[test]
+    fn logsource_mismatch_is_unicode_case_insensitive() {
+        let ls = |p: &str| LogSource {
+            product: Some(p.to_string()),
+            ..Default::default()
+        };
+        assert!(logsource_mismatch(&ls("WİNDOWS"), &ls("windows")).is_some());
+        assert!(logsource_mismatch(&ls("ÄÖ"), &ls("äö")).is_none());
+        assert!(logsource_mismatch(&ls("Windows"), &ls("WINDOWS")).is_none());
+    }
+
+    #[test]
     fn filter_with_a_different_logsource_warns_per_targeted_rule() {
         let src = format!(
             "{}---\ntitle: f\nlogsource:\n    product: linux\n    service: auth\nfilter:\n    rules: [r1]\n    sel:\n        User: x\n    condition: sel\n",
@@ -1327,6 +1349,18 @@ mod tests {
         );
         // The budget cut the work short: not all 24 rules were attempted.
         assert!(errs.len() < 24, "{}", errs.len());
+        // Every attempted rule (including the crossing one) has its own error; only
+        // the rest were skipped, so the crossing document is not in the count.
+        let attempted = errs.len() - 1;
+        let total = errs
+            .iter()
+            .find(|m| m.contains("total compile budget"))
+            .unwrap();
+        assert!(
+            total.contains(&format!("({} documents skipped)", 24 - attempted)),
+            "{total}"
+        );
+        assert!(total.contains("later rules were skipped"), "{total}");
     }
 
     #[test]
