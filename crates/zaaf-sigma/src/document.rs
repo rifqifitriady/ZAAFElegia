@@ -392,12 +392,14 @@ fn parse_rule(doc: &Node, map: &Map, warns: &mut Diags) -> Result<Rule, Diags> {
         date: meta_str(map, "date", warns),
         modified: meta_str(map, "modified", warns),
     };
-    assemble(doc, map, diags, detection, |title, logsource, detection| Rule {
-        meta: RuleMeta { title, ..meta },
-        logsource,
-        detection,
-        line,
-        col,
+    assemble(doc, map, diags, detection, |title, logsource, detection| {
+        Rule {
+            meta: RuleMeta { title, ..meta },
+            logsource,
+            detection,
+            line,
+            col,
+        }
     })
 }
 
@@ -436,15 +438,17 @@ fn parse_filter(doc: &Node, map: &Map, warns: &mut Diags) -> Result<Filter, Diag
     };
     let (line, col) = line_col(doc);
     let (id, name) = (meta_str(map, "id", warns), meta_str(map, "name", warns));
-    assemble(doc, map, diags, detection, |title, logsource, detection| Filter {
-        title,
-        id,
-        name,
-        logsource,
-        rules,
-        detection,
-        line,
-        col,
+    assemble(doc, map, diags, detection, |title, logsource, detection| {
+        Filter {
+            title,
+            id,
+            name,
+            logsource,
+            rules,
+            detection,
+            line,
+            col,
+        }
     })
 }
 
@@ -964,9 +968,7 @@ level: low
         assert_eq!(p.diagnostics.len(), 1, "{:?}", p.diagnostics);
         assert_eq!(p.diagnostics[0].message, "`title` must be a string");
         assert_eq!(p.diagnostics[0].location, Location::at(1, 8, "title"));
-        let p = parse_str(
-            "logsource: {product: x}\ndetection: {s: {A: 1}, condition: s}\n",
-        );
+        let p = parse_str("logsource: {product: x}\ndetection: {s: {A: 1}, condition: s}\n");
         assert_eq!(p.diagnostics[0].message, "missing mandatory `title`");
     }
 
@@ -1007,14 +1009,9 @@ level: low
             "{msgs:?}"
         );
         // at document level
-        let p = parse_str(&format!(
-            "{anchored}<<: *d\ntitle: t\n"
-        ));
+        let p = parse_str(&format!("{anchored}<<: *d\ntitle: t\n"));
         let msgs = diag_msgs(&p);
-        assert!(
-            msgs.iter().any(|m| m.contains("merge keys")),
-            "{msgs:?}"
-        );
+        assert!(msgs.iter().any(|m| m.contains("merge keys")), "{msgs:?}");
         // directly in `detection`
         let p = parse_str(&format!(
             "{anchored}title: t\nlogsource: {{product: x}}\ndetection:\n    <<: *d\n    condition: s\n"

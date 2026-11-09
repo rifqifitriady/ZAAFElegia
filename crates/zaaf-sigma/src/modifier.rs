@@ -195,11 +195,43 @@ mod tests {
     fn name_parses_back_for_every_variant() {
         use Modifier::*;
         let all = [
-            All, StartsWith, EndsWith, Contains, Exists, Cased, Neq, Windash, Re, ReInsensitive,
-            ReMultiline, ReDotAll, Base64, Base64Offset, Utf16Le, Utf16Be, Utf16, Wide, Lt, Lte,
-            Gt, Gte, Minute, Hour, Day, Week, Month, Year, Cidr, Expand, FieldRef,
+            All,
+            StartsWith,
+            EndsWith,
+            Contains,
+            Exists,
+            Cased,
+            Neq,
+            Windash,
+            Re,
+            ReInsensitive,
+            ReMultiline,
+            ReDotAll,
+            Base64,
+            Base64Offset,
+            Utf16Le,
+            Utf16Be,
+            Utf16,
+            Wide,
+            Lt,
+            Lte,
+            Gt,
+            Gte,
+            Minute,
+            Hour,
+            Day,
+            Week,
+            Month,
+            Year,
+            Cidr,
+            Expand,
+            FieldRef,
         ];
-        assert_eq!(all.len(), TABLE.len(), "variant list out of sync with TABLE");
+        assert_eq!(
+            all.len(),
+            TABLE.len(),
+            "variant list out of sync with TABLE"
+        );
         for m in all {
             assert_eq!(Modifier::parse(m.name()), Some(m), "{m:?}");
         }

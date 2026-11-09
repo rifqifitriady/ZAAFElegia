@@ -308,7 +308,10 @@ mod tests {
         assert_eq!(msg("and a"), "unexpected keyword `and`");
         assert_eq!(msg("a b"), "unexpected token `b`");
         assert_eq!(msg("a and"), "unexpected end of condition");
-        assert_eq!(msg("1 of"), "`1 of` must be followed by `them` or a pattern");
+        assert_eq!(
+            msg("1 of"),
+            "`1 of` must be followed by `them` or a pattern"
+        );
         assert_eq!(msg(""), "empty condition");
     }
 

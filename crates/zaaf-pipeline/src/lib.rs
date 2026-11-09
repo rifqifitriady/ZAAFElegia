@@ -392,8 +392,9 @@ mod tests {
 
     #[test]
     fn fields_within_one_condition_are_anded() {
-        let set =
-            mapping_with_conditions("      - product: windows\n        category: process_creation\n");
+        let set = mapping_with_conditions(
+            "      - product: windows\n        category: process_creation\n",
+        );
         assert!(
             set.map_field(&full_ls("process_creation", "windows"), "Image")
                 .mapped
