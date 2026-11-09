@@ -57,7 +57,7 @@ pub fn run(args: CheckArgs) -> u8 {
     let pipelines = match PipelineSet::load(&args.pipelines) {
         Ok(p) => p,
         Err(d) => {
-            eprintln!("{d}");
+            eprintln!("{}", sanitize(&d.to_string()));
             return exit::RULE_ERRORS;
         }
     };

@@ -236,11 +236,47 @@ fn row(f: &Value) -> [String; 7] {
     ]
 }
 
-/// Unicode format characters that can reorder or hide text: zero-width and
-/// directional marks (U+200B..U+200F), line/paragraph separators (U+2028/2029),
-/// bidi embeddings/overrides (U+202A..U+202E) and bidi isolates (U+2066..U+2069).
+/// Every Unicode general-category Cf (format) range as of Unicode 16, which covers
+/// soft hyphen, Arabic marks, zero-width and directional marks, bidi controls, word
+/// joiner and invisible operators, BOM/ZWNBSP, interlinear annotation and tag
+/// characters, plus the line/paragraph separators U+2028/2029 (categories Zl/Zp).
+/// std has no category API, hence the table; ranges are sorted and inclusive.
+const INVISIBLE_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x2028, 0x202E),
+    (0x2060, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
 fn is_invisible_format(c: char) -> bool {
-    matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    let c = c as u32;
+    INVISIBLE_RANGES
+        .binary_search_by(|&(lo, hi)| {
+            if hi < c {
+                std::cmp::Ordering::Less
+            } else if lo > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// Replaces control characters with visible `\xNN` escapes, and invisible Unicode
@@ -412,6 +448,15 @@ mod tests {
             );
         }
         assert_eq!(sanitize("é日本\u{200a}"), "é日本\u{200a}");
+        for (c, esc) in [
+            ('\u{feff}', "\\u{feff}"),
+            ('\u{061c}', "\\u{061c}"),
+            ('\u{2060}', "\\u{2060}"),
+            ('\u{00ad}', "\\u{00ad}"),
+            ('\u{e0041}', "\\u{e0041}"),
+        ] {
+            assert_eq!(sanitize(&format!("a{c}b")), format!("a{esc}b"));
+        }
     }
 
     #[test]
