@@ -1,0 +1,7 @@
+title: lte
+id: c011-lte
+logsource: {product: test}
+detection:
+    s:
+        Size|lte: 10
+    condition: s

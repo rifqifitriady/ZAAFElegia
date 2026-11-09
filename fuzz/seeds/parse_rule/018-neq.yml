@@ -1,0 +1,8 @@
+title: fieldref neq
+id: c018-neq
+logsource: {product: test}
+detection:
+    s:
+        Cmd2|exists: true
+        Image|fieldref|neq: TargetFilename
+    condition: s

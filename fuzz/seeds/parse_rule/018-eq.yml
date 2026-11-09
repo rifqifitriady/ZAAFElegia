@@ -1,0 +1,7 @@
+title: fieldref equals
+id: c018-eq
+logsource: {product: test}
+detection:
+    s:
+        TargetFilename|fieldref: Image
+    condition: s
