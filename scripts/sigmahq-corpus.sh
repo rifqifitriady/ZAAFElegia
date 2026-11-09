@@ -13,7 +13,7 @@ trap 'rm -rf "$WORK"' EXIT
 git init -q "$WORK/sigma"
 git -C "$WORK/sigma" fetch -q --depth 1 https://github.com/SigmaHQ/sigma.git "$REF"
 git -C "$WORK/sigma" checkout -q FETCH_HEAD
-cargo build --quiet --release -p zaaf-cli --manifest-path "$ROOT/Cargo.toml"
+cargo build --locked --quiet --release -p zaaf-cli --manifest-path "$ROOT/Cargo.toml"
 
 cd "$WORK/sigma"
 set +e
