@@ -53,9 +53,6 @@ impl Val {
 pub(crate) fn apply(m: Modifier, vals: Vec<Val>) -> Result<Vec<Val>, String> {
     let mut out = Vec::new();
     for v in vals {
-        if out.len() > MAX_EXPANSION {
-            return Err(expansion_error());
-        }
         match m {
             Modifier::Contains => {
                 let mut s = v.into_sigma();
@@ -86,12 +83,20 @@ pub(crate) fn apply(m: Modifier, vals: Vec<Val>) -> Result<Vec<Val>, String> {
             }
             Modifier::Utf16Be => out.push(Val::B(utf16(&v.text(m)?, true, false))),
             Modifier::Utf16 => out.push(Val::B(utf16(&v.text(m)?, false, true))),
-            Modifier::Windash => out.extend(windash(&v.into_sigma())?.into_iter().map(Val::S)),
+            Modifier::Windash => {
+                let variants = windash(&v.into_sigma())?;
+                // Check before extending so the peak stays near MAX_EXPANSION.
+                if out.len() + variants.len() > MAX_EXPANSION {
+                    return Err(expansion_error());
+                }
+                out.extend(variants.into_iter().map(Val::S));
+            }
             other => return Err(format!("`{}` is not a string transformation", other.name())),
         }
-    }
-    if out.len() > MAX_EXPANSION {
-        return Err(expansion_error());
+        // Checked after every value, so the output never grows far past the cap.
+        if out.len() > MAX_EXPANSION {
+            return Err(expansion_error());
+        }
     }
     Ok(out)
 }
@@ -339,6 +344,33 @@ mod tests {
     #[test]
     fn windash_expansion_is_capped() {
         let err = windash(&SigmaString::parse(&" -a".repeat(20))).unwrap_err();
+        assert!(err.contains("value expansion exceeds"), "{err}");
+    }
+
+    #[test]
+    fn windash_boundaries_compile() {
+        let four = windash(&SigmaString::parse(&" -a".repeat(4))).unwrap();
+        assert_eq!(four.len(), 625);
+        let five = windash(&SigmaString::parse(&" -a".repeat(5))).unwrap();
+        assert_eq!(five.len(), 3125);
+        let six = windash(&SigmaString::parse(&" -a".repeat(6)));
+        assert!(six.is_err());
+        let vals = apply(
+            Modifier::Windash,
+            vec![Val::S(SigmaString::parse(&" -a".repeat(5)))],
+        )
+        .unwrap();
+        assert_eq!(vals.len(), 3125);
+    }
+
+    #[test]
+    fn apply_rejects_a_second_value_that_would_cross_the_cap() {
+        // 3125 + 3125 > 4096: rejected without ever holding both in `out`.
+        let vals = vec![
+            Val::S(SigmaString::parse(&" -a".repeat(5))),
+            Val::S(SigmaString::parse(&" -a".repeat(5))),
+        ];
+        let err = apply(Modifier::Windash, vals).unwrap_err();
         assert!(err.contains("value expansion exceeds"), "{err}");
     }
 
