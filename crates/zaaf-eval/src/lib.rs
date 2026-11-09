@@ -130,6 +130,7 @@ fn timestamp_of(v: &FieldValue) -> Option<DateTime<Utc>> {
     match v {
         FieldValue::Str(s) => parse_timestamp(s),
         FieldValue::Int(i) => timestamp_from_epoch(*i as f64),
+        FieldValue::Uint(u) => timestamp_from_epoch(*u as f64),
         FieldValue::Float(f) => timestamp_from_epoch(*f),
         FieldValue::Bool(_) | FieldValue::Null => None,
     }
