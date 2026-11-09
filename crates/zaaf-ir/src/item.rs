@@ -48,11 +48,14 @@ pub(crate) fn or(mut v: Vec<Expr>) -> Expr {
     }
 }
 
+/// `attempted` receives the regex weight compiled so far, also when the item then fails,
+/// so the caller can charge the work to its budget.
 pub(crate) fn compile_item(
     item: &FieldItem,
     logsource: &LogSource,
     pipelines: &PipelineSet,
     warnings: &mut Vec<String>,
+    attempted: &mut usize,
 ) -> Result<Expr, String> {
     use Modifier::*;
     let mods = &item.modifiers;
@@ -185,6 +188,7 @@ pub(crate) fn compile_item(
                 };
                 let re = CompiledRegex::new(src, flags)?;
                 regex_weight += re.weight() as usize;
+                *attempted = regex_weight;
                 if regex_weight > crate::rule::MAX_RULE_PREDICATES {
                     return Err(format!(
                         "rule exceeds the budget of {} weight units",
@@ -273,11 +277,21 @@ pub(crate) fn compile_item(
             let out = g
                 .iter()
                 .map(|v| match v {
-                    RuleValue::Str(other) => Ok(pred(Matcher::FieldRef {
-                        other: pipelines.map_field(logsource, other).names,
-                        mode,
-                        case_sensitive,
-                    })),
+                    RuleValue::Str(other) => {
+                        let mapped = pipelines.map_field(logsource, other);
+                        let warning = format!("field `{other}` is not mapped by any pipeline");
+                        if pipelines.has_field_mappings()
+                            && !mapped.mapped
+                            && !warnings.contains(&warning)
+                        {
+                            warnings.push(warning);
+                        }
+                        Ok(pred(Matcher::FieldRef {
+                            other: mapped.names,
+                            mode,
+                            case_sensitive,
+                        }))
+                    }
                     _ => Err("`fieldref` needs field names as values".to_string()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
