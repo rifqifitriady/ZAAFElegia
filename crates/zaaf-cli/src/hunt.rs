@@ -44,7 +44,9 @@ pub struct HuntArgs {
     /// Processing pipeline files, applied in priority order
     #[arg(short = 'p', long = "pipeline")]
     pub pipelines: Vec<PathBuf>,
-    /// Output format [default: table on a terminal, ndjson otherwise]
+    /// Output format [default: table on a terminal, ndjson otherwise]. `ndjson` and `csv`
+    /// stream; `json` and `table` hold every finding in memory until the end of the run
+    /// (`json` is one array)
     #[arg(short = 'o', long = "output", value_enum)]
     pub output: Option<OutputFormat>,
     /// Only run rules at or above this level
@@ -168,6 +170,11 @@ fn warn_regex_limits(evaluator: &Evaluator) {
 /// Exit-code precedence when several conditions hold: 4 > 3 > 2 > 1 > 0.
 /// Unreadable inputs always give 3; malformed records give 3 only with
 /// `--strict` (or past `--max-errors`); `--fail-on-match` (1) loses to both.
+///
+/// Two cases sit outside that ordering. Exit 2 (rule or usage errors) is returned by
+/// `run` before any input is scanned, so it never competes with 3 or 1. A broken
+/// output pipe returns 0 immediately, mid-scan, and skips the remaining inputs and
+/// every other condition (so it also hides 3 and 1).
 fn scan(
     args: &HuntArgs,
     evaluator: &Evaluator,
