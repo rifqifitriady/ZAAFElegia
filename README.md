@@ -173,7 +173,7 @@ The table shows the author but not the references, which are too long for it; us
 |---|---|
 | 0 | Success |
 | 1 | Matches found (only with `--fail-on-match`) |
-| 2 | Usage errors. `zaaf check` exits 2 on any rule error; `zaaf hunt` exits 2 on rule errors only with `--strict`, and also when no rules are left to run |
+| 2 | Usage errors. `zaaf check` exits 2 on any rule error, and also when the given paths contain no rule files at all; `zaaf hunt` exits 2 on rule errors only with `--strict`, and also when no rules are left to run |
 | 3 | Input errors: an unreadable input always (missing file, a directory, or a read error); malformed records (including oversized lines) only with `--strict` or above `--max-errors` |
 | 4 | Internal error |
 
