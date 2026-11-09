@@ -42,9 +42,12 @@ pub struct Detection {
     pub search_ids: Vec<SearchIdentifier>,
     /// Several conditions are OR'd.
     pub conditions: Vec<CondExpr>,
-    /// 1-based position of the `condition` value.
+    /// 1-based position of the `condition` value (of its first entry for a list).
     pub condition_line: usize,
     pub condition_col: usize,
+    /// 1-based `(line, col)` of each entry of `conditions`, in the same order. The first
+    /// equals `(condition_line, condition_col)` unless `condition` is a list.
+    pub condition_positions: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -149,7 +152,7 @@ pub fn parse_str(src: &str) -> ParsedFile {
         if doc.data.is_null() {
             continue;
         }
-        match parse_document(doc) {
+        match parse_document(doc, &mut out.diagnostics) {
             Ok(d) => out.documents.push(d),
             Err(mut d) => out.diagnostics.append(&mut d),
         }
@@ -175,10 +178,14 @@ pub fn parse_file(path: &Path) -> ParsedFile {
     parsed
 }
 
-fn parse_document(doc: &Node) -> Result<Document, Diags> {
+/// `warns` collects non-fatal findings (they are kept even when the document is rejected).
+fn parse_document(doc: &Node, warns: &mut Diags) -> Result<Document, Diags> {
     let YamlData::Mapping(map) = &doc.data else {
         return Err(vec![err(doc, "", "document is not a YAML mapping")]);
     };
+    if let Some(d) = merge_key_error(map, "") {
+        return Err(vec![d]);
+    }
     if let Some((key, _)) = entry(map, "action") {
         return Err(vec![err(
             key,
@@ -198,10 +205,10 @@ fn parse_document(doc: &Node) -> Result<Document, Diags> {
         }));
     }
     if has("filter") && !has("detection") {
-        return parse_filter(doc, map).map(Document::Filter);
+        return parse_filter(doc, map, warns).map(Document::Filter);
     }
     if has("detection") {
-        return parse_rule(doc, map).map(Document::Rule);
+        return parse_rule(doc, map, warns).map(Document::Rule);
     }
     Err(vec![err(
         doc,
@@ -210,23 +217,121 @@ fn parse_document(doc: &Node) -> Result<Document, Diags> {
     )])
 }
 
-fn get_str(map: &Map, key: &str) -> Option<String> {
-    match &get(map, key)?.data {
-        YamlData::Value(Scalar::String(s)) => Some(s.to_string()),
-        YamlData::Value(Scalar::Integer(i)) => Some(i.to_string()),
-        YamlData::Value(Scalar::FloatingPoint(f)) => Some(f.into_inner().to_string()),
-        _ => None,
+/// A scalar mapping value as text. `Ok(None)` when the key is absent or null, `Err` with
+/// the value node when it has the wrong type (booleans, lists, mappings).
+fn str_of<'n, 'a>(map: &'n Map<'a>, key: &str) -> Result<Option<String>, &'n Node<'a>> {
+    let Some(node) = get(map, key) else {
+        return Ok(None);
+    };
+    match &node.data {
+        YamlData::Value(Scalar::String(s)) => Ok(Some(s.to_string())),
+        YamlData::Value(Scalar::Integer(i)) => Ok(Some(i.to_string())),
+        YamlData::Value(Scalar::FloatingPoint(f)) => Ok(Some(f.into_inner().to_string())),
+        YamlData::Value(Scalar::Null) => Ok(None),
+        _ => Err(node),
     }
 }
 
-fn get_str_list(map: &Map, key: &str) -> Vec<String> {
-    match get(map, key).map(|n| &n.data) {
-        Some(YamlData::Sequence(seq)) => seq
-            .iter()
-            .filter_map(|v| v.data.as_str().map(str::to_string))
-            .collect(),
-        Some(YamlData::Value(Scalar::String(s))) => vec![s.to_string()],
-        _ => Vec::new(),
+/// Lenient text lookup: a missing or wrongly typed value is `None`.
+fn get_str(map: &Map, key: &str) -> Option<String> {
+    str_of(map, key).ok().flatten()
+}
+
+fn warn(node: &Node, path: &str, msg: impl Into<String>) -> Diagnostic {
+    let (line, col) = line_col(node);
+    Diagnostic::warning(Location::at(line, col, path), msg)
+}
+
+/// Optional text metadata; a wrongly typed value is ignored with a warning.
+fn meta_str(map: &Map, key: &str, warns: &mut Diags) -> Option<String> {
+    match str_of(map, key) {
+        Ok(v) => v,
+        Err(node) => {
+            warns.push(warn(
+                node,
+                key,
+                format!("`{key}` must be a string; the value is ignored"),
+            ));
+            None
+        }
+    }
+}
+
+/// A list of strings (or one string). Entries of another type are dropped with a warning
+/// naming the field.
+fn get_str_list(map: &Map, key: &str, warns: &mut Diags) -> Vec<String> {
+    let Some(node) = get(map, key) else {
+        return Vec::new();
+    };
+    match &node.data {
+        YamlData::Sequence(seq) => {
+            let mut out = Vec::new();
+            for (i, v) in seq.iter().enumerate() {
+                match v.data.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => warns.push(warn(
+                        v,
+                        &format!("{key}[{i}]"),
+                        format!("`{key}` entries must be strings; this entry is ignored"),
+                    )),
+                }
+            }
+            out
+        }
+        YamlData::Value(Scalar::String(s)) => vec![s.to_string()],
+        YamlData::Value(Scalar::Null) => Vec::new(),
+        _ => {
+            warns.push(warn(
+                node,
+                key,
+                format!("`{key}` must be a string or a list of strings; the value is ignored"),
+            ));
+            Vec::new()
+        }
+    }
+}
+
+/// An error when `map` uses a YAML merge key (`<<`), which Sigma documents may not use.
+fn merge_key_error(map: &Map, path: &str) -> Option<Diagnostic> {
+    map.iter()
+        .find(|(k, _)| k.data.as_str() == Some("<<"))
+        .map(|(k, _)| err(k, path, "YAML merge keys (`<<`) are not supported"))
+}
+
+/// The mandatory `title` (a missing or non-string one is an error in `diags`).
+fn parse_title(doc: &Node, map: &Map, diags: &mut Diags) -> Option<String> {
+    match str_of(map, "title") {
+        Ok(Some(t)) => Some(t),
+        Ok(None) => {
+            diags.push(err(doc, "title", "missing mandatory `title`"));
+            None
+        }
+        Err(node) => {
+            diags.push(err(node, "title", "`title` must be a string"));
+            None
+        }
+    }
+}
+
+/// Shared skeleton of rules and filters: the common title and logsource, then the
+/// detection parsed by `detection`. Builds the document with `build` when everything is
+/// valid, otherwise returns all collected errors.
+fn assemble<T>(
+    doc: &Node,
+    map: &Map,
+    mut diags: Diags,
+    detection: Option<Detection>,
+    build: impl FnOnce(String, LogSource, Detection) -> T,
+) -> Result<T, Diags> {
+    let title = parse_title(doc, map, &mut diags);
+    let logsource = parse_logsource(doc, map)
+        .map_err(|mut d| diags.append(&mut d))
+        .ok();
+    match (title, logsource, detection) {
+        (Some(title), Some(logsource), Some(detection)) if diags.is_empty() => {
+            Ok(build(title, logsource, detection))
+        }
+        _ => Err(diags),
     }
 }
 
@@ -251,15 +356,8 @@ fn parse_logsource(doc: &Node, map: &Map) -> Result<LogSource, Diags> {
     }
 }
 
-fn parse_rule(doc: &Node, map: &Map) -> Result<Rule, Diags> {
+fn parse_rule(doc: &Node, map: &Map, warns: &mut Diags) -> Result<Rule, Diags> {
     let mut diags = Vec::new();
-    let title = get_str(map, "title");
-    if title.is_none() {
-        diags.push(err(doc, "title", "missing mandatory `title`"));
-    }
-    let logsource = parse_logsource(doc, map)
-        .map_err(|mut d| diags.append(&mut d))
-        .ok();
     let detection = match entry(map, "detection") {
         Some((
             key,
@@ -280,40 +378,31 @@ fn parse_rule(doc: &Node, map: &Map) -> Result<Rule, Diags> {
         }
     };
     let (line, col) = line_col(doc);
-    match (title, logsource, detection) {
-        (Some(title), Some(logsource), Some(detection)) if diags.is_empty() => Ok(Rule {
-            meta: RuleMeta {
-                title,
-                id: get_str(map, "id"),
-                name: get_str(map, "name"),
-                status: get_str(map, "status"),
-                level: get_str(map, "level"),
-                description: get_str(map, "description"),
-                author: get_str(map, "author"),
-                references: get_str_list(map, "references"),
-                tags: get_str_list(map, "tags"),
-                falsepositives: get_str_list(map, "falsepositives"),
-                date: get_str(map, "date"),
-                modified: get_str(map, "modified"),
-            },
-            logsource,
-            detection,
-            line,
-            col,
-        }),
-        _ => Err(diags),
-    }
+    let meta = RuleMeta {
+        title: String::new(),
+        id: meta_str(map, "id", warns),
+        name: meta_str(map, "name", warns),
+        status: meta_str(map, "status", warns),
+        level: meta_str(map, "level", warns),
+        description: meta_str(map, "description", warns),
+        author: meta_str(map, "author", warns),
+        references: get_str_list(map, "references", warns),
+        tags: get_str_list(map, "tags", warns),
+        falsepositives: get_str_list(map, "falsepositives", warns),
+        date: meta_str(map, "date", warns),
+        modified: meta_str(map, "modified", warns),
+    };
+    assemble(doc, map, diags, detection, |title, logsource, detection| Rule {
+        meta: RuleMeta { title, ..meta },
+        logsource,
+        detection,
+        line,
+        col,
+    })
 }
 
-fn parse_filter(doc: &Node, map: &Map) -> Result<Filter, Diags> {
+fn parse_filter(doc: &Node, map: &Map, warns: &mut Diags) -> Result<Filter, Diags> {
     let mut diags = Vec::new();
-    let title = get_str(map, "title");
-    if title.is_none() {
-        diags.push(err(doc, "title", "missing mandatory `title`"));
-    }
-    let logsource = parse_logsource(doc, map)
-        .map_err(|mut d| diags.append(&mut d))
-        .ok();
     let mut rules = Vec::new();
     let detection = match entry(map, "filter") {
         Some((
@@ -323,7 +412,7 @@ fn parse_filter(doc: &Node, map: &Map) -> Result<Filter, Diags> {
                 ..
             },
         )) => {
-            rules = get_str_list(fm, "rules");
+            rules = get_str_list(fm, "rules", warns);
             if rules.is_empty() {
                 let at = entry(fm, "rules").map_or(key, |(k, _)| k);
                 diags.push(err(
@@ -346,19 +435,17 @@ fn parse_filter(doc: &Node, map: &Map) -> Result<Filter, Diags> {
         }
     };
     let (line, col) = line_col(doc);
-    match (title, logsource, detection) {
-        (Some(title), Some(logsource), Some(detection)) if diags.is_empty() => Ok(Filter {
-            title,
-            id: get_str(map, "id"),
-            name: get_str(map, "name"),
-            logsource,
-            rules,
-            detection,
-            line,
-            col,
-        }),
-        _ => Err(diags),
-    }
+    let (id, name) = (meta_str(map, "id", warns), meta_str(map, "name", warns));
+    assemble(doc, map, diags, detection, |title, logsource, detection| Filter {
+        title,
+        id,
+        name,
+        logsource,
+        rules,
+        detection,
+        line,
+        col,
+    })
 }
 
 /// `key` is the `detection:` / `filter:` key node, `dm` its mapping.
@@ -369,8 +456,12 @@ fn parse_detection(
     reserved: &[&str],
 ) -> Result<Detection, Diags> {
     let mut diags = Vec::new();
+    if let Some(d) = merge_key_error(dm, base) {
+        return Err(vec![d]);
+    }
     let mut search_ids = Vec::new();
     let mut conditions = Vec::new();
+    let mut condition_positions = Vec::new();
     let mut condition_at = None;
     for (k, v) in dm {
         let Some(name) = k.data.as_str() else {
@@ -383,10 +474,20 @@ fn parse_detection(
                 condition_at = Some(line_col(v));
                 let sources: Vec<(&str, &Node)> = match &v.data {
                     YamlData::Value(Scalar::String(s)) => vec![(s.as_ref(), v)],
-                    YamlData::Sequence(seq) => seq
-                        .iter()
-                        .filter_map(|x| x.data.as_str().map(|s| (s, x)))
-                        .collect(),
+                    YamlData::Sequence(seq) => {
+                        let mut items = Vec::new();
+                        for (i, x) in seq.iter().enumerate() {
+                            match x.data.as_str() {
+                                Some(s) => items.push((s, x)),
+                                None => diags.push(err(
+                                    x,
+                                    &format!("{path}[{i}]"),
+                                    "`condition` list entries must be strings",
+                                )),
+                            }
+                        }
+                        items
+                    }
                     _ => {
                         diags.push(err(
                             v,
@@ -398,7 +499,10 @@ fn parse_detection(
                 };
                 for (s, node) in sources {
                     match parse_condition(s) {
-                        Ok(c) => conditions.push(c),
+                        Ok(c) => {
+                            conditions.push(c);
+                            condition_positions.push(line_col(node));
+                        }
                         Err(e) => diags.push(err(node, &path, format!("invalid condition: {e}"))),
                     }
                 }
@@ -421,12 +525,17 @@ fn parse_detection(
     if !diags.is_empty() {
         return Err(diags);
     }
-    let (condition_line, condition_col) = condition_at.unwrap_or_else(|| line_col(key));
+    let (condition_line, condition_col) = condition_positions
+        .first()
+        .copied()
+        .or(condition_at)
+        .unwrap_or_else(|| line_col(key));
     Ok(Detection {
         search_ids,
         conditions,
         condition_line,
         condition_col,
+        condition_positions,
     })
 }
 
@@ -480,6 +589,9 @@ fn parse_search_id(
 fn parse_map(path: &str, node: &Node, m: &Map) -> Result<Vec<FieldItem>, Diags> {
     let mut items = Vec::new();
     let mut diags = Vec::new();
+    if let Some(d) = merge_key_error(m, path) {
+        return Err(vec![d]);
+    }
     if m.is_empty() {
         diags.push(err(node, path, "empty selection"));
     }
@@ -805,5 +917,136 @@ level: low
             p.diagnostics[0].file.as_deref(),
             Some(std::path::Path::new("/nonexistent/rule.yml"))
         );
+    }
+
+    fn diag_msgs(p: &ParsedFile) -> Vec<String> {
+        p.diagnostics.iter().map(|d| d.to_string()).collect()
+    }
+
+    #[test]
+    fn non_string_condition_items_are_errors_at_their_position() {
+        let p = parse_str(&rule_with(
+            "    s:\n        A: 1\n    condition:\n        - s\n        - 5\n        - true\n",
+        ));
+        assert!(p.documents.is_empty());
+        assert_eq!(p.diagnostics.len(), 2, "{:?}", p.diagnostics);
+        assert_eq!(
+            p.diagnostics[0].location,
+            Location::at(10, 11, "detection.condition[1]")
+        );
+        assert_eq!(
+            p.diagnostics[1].location,
+            Location::at(11, 11, "detection.condition[2]")
+        );
+        assert!(p.diagnostics[0].message.contains("must be strings"));
+    }
+
+    #[test]
+    fn condition_positions_track_each_list_entry() {
+        let r = only_rule(&rule_with(
+            "    s:\n        A: 1\n    condition:\n        - s\n        - not s\n",
+        ));
+        assert_eq!(r.detection.condition_positions, vec![(9, 11), (10, 11)]);
+        assert_eq!(
+            (r.detection.condition_line, r.detection.condition_col),
+            r.detection.condition_positions[0]
+        );
+        let r = only_rule(&rule_with("    s:\n        A: 1\n    condition: s\n"));
+        assert_eq!(r.detection.condition_positions, vec![(8, 16)]);
+    }
+
+    #[test]
+    fn non_string_title_is_a_type_error_not_missing() {
+        let p = parse_str(
+            "title: true\nlogsource: {product: x}\ndetection: {s: {A: 1}, condition: s}\n",
+        );
+        assert!(p.documents.is_empty());
+        assert_eq!(p.diagnostics.len(), 1, "{:?}", p.diagnostics);
+        assert_eq!(p.diagnostics[0].message, "`title` must be a string");
+        assert_eq!(p.diagnostics[0].location, Location::at(1, 8, "title"));
+        let p = parse_str(
+            "logsource: {product: x}\ndetection: {s: {A: 1}, condition: s}\n",
+        );
+        assert_eq!(p.diagnostics[0].message, "missing mandatory `title`");
+    }
+
+    #[test]
+    fn wrongly_typed_metadata_warns_naming_the_field() {
+        let src = "title: t\nid: r1\nlogsource: {product: x}\ntags:\n    - ok\n    - 5\nreferences: [a, [b]]\nfalsepositives:\n    - {x: 1}\nlevel: [high]\ndetection: {s: {A: 1}, condition: s}\n";
+        let p = parse_str(src);
+        assert_eq!(p.documents.len(), 1, "{:?}", p.diagnostics);
+        let Document::Rule(r) = &p.documents[0] else {
+            panic!("rule expected")
+        };
+        assert_eq!(r.meta.tags, vec!["ok"]);
+        assert_eq!(r.meta.references, vec!["a"]);
+        assert!(r.meta.falsepositives.is_empty());
+        assert_eq!(r.meta.level, None);
+        assert!(p.diagnostics.iter().all(|d| !d.is_error()));
+        let msgs = diag_msgs(&p);
+        for field in ["tags", "references", "falsepositives", "level"] {
+            assert!(
+                msgs.iter()
+                    .any(|m| m.contains("warning") && m.contains(&format!("`{field}`"))),
+                "{field}: {msgs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_merge_keys_are_rejected_clearly() {
+        let anchored = "defaults: &d\n    A: 1\n";
+        // inside a selection
+        let p = parse_str(&format!(
+            "{anchored}title: t\nlogsource: {{product: x}}\ndetection:\n    s:\n        <<: *d\n    condition: s\n"
+        ));
+        let msgs = diag_msgs(&p);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("YAML merge keys (`<<`) are not supported")),
+            "{msgs:?}"
+        );
+        // at document level
+        let p = parse_str(&format!(
+            "{anchored}<<: *d\ntitle: t\n"
+        ));
+        let msgs = diag_msgs(&p);
+        assert!(
+            msgs.iter().any(|m| m.contains("merge keys")),
+            "{msgs:?}"
+        );
+        // directly in `detection`
+        let p = parse_str(&format!(
+            "{anchored}title: t\nlogsource: {{product: x}}\ndetection:\n    <<: *d\n    condition: s\n"
+        ));
+        let msgs = diag_msgs(&p);
+        assert!(msgs.iter().any(|m| m.contains("merge keys")), "{msgs:?}");
+    }
+
+    #[test]
+    fn hostile_deep_nesting_reports_the_recursion_limit() {
+        let src = format!("a: {}1{}\n", "[".repeat(5_000), "]".repeat(5_000));
+        let p = parse_str(&src);
+        assert!(p.documents.is_empty());
+        assert_eq!(p.diagnostics.len(), 1, "{:?}", p.diagnostics);
+        let m = &p.diagnostics[0].message;
+        assert!(m.starts_with("invalid YAML"), "{m}");
+        assert!(m.contains("recursion limit"), "{m}");
+    }
+
+    #[test]
+    fn hostile_alias_bomb_reports_the_node_budget() {
+        let mut src = String::from("a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n");
+        for i in 1..12 {
+            let prev = format!("*a{}", i - 1);
+            let items = vec![prev; 10].join(", ");
+            src.push_str(&format!("a{i}: &a{i} [{items}]\n"));
+        }
+        let p = parse_str(&src);
+        assert!(p.documents.is_empty());
+        assert_eq!(p.diagnostics.len(), 1, "{:?}", p.diagnostics);
+        let m = &p.diagnostics[0].message;
+        assert!(m.starts_with("invalid YAML"), "{m}");
+        assert!(m.contains("node budget"), "{m}");
     }
 }
