@@ -236,7 +236,7 @@ fn row(f: &Value) -> [String; 7] {
     ]
 }
 
-/// Every Unicode general-category Cf (format) range as of Unicode 16, which covers
+/// Every Unicode general-category Cf (format) range as of Unicode 17.0, which covers
 /// soft hyphen, Arabic marks, zero-width and directional marks, bidi controls, word
 /// joiner and invisible operators, BOM/ZWNBSP, interlinear annotation and tag
 /// characters, plus the line/paragraph separators U+2028/2029 (categories Zl/Zp).
