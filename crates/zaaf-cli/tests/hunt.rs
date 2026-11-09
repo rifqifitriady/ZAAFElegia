@@ -406,3 +406,27 @@ fn max_line_bytes_must_be_positive() {
         .assert()
         .code(2);
 }
+
+#[test]
+fn json_array_streams_events_before_a_broken_element() {
+    let dir = setup();
+    fs::write(
+        dir.path().join("arr.json"),
+        "[\n{\"CommandLine\": \"cmd /c whoami\"},\n{\"CommandLine\": }\n]",
+    )
+    .unwrap();
+    let out = zaaf()
+        .arg("hunt")
+        .arg("-r")
+        .arg(dir.path().join("rules"))
+        .arg(dir.path().join("arr.json"))
+        .args(["-o", "ndjson"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("r-whoami"), "{stdout}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("arr.json: invalid JSON array"), "{stderr}");
+    assert!(stderr.contains("1 events"), "{stderr}");
+}

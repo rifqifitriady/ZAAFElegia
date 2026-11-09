@@ -4,20 +4,22 @@
 //! BOM): `[` means a single JSON array, anything else is NDJSON.
 //!
 //! NDJSON is streamed line by line; each line is capped at [`MAX_LINE_BYTES`].
-//! JSON array input is **fully buffered** in memory before parsing and is
-//! capped at [`MAX_ARRAY_BYTES`]; an array that is invalid or over the cap fails as a whole
-//! with a fatal error (the input is unreadable); use NDJSON for large inputs.
+//! A JSON array is streamed element by element: only the element being read is held in
+//! memory, never the whole array. The array as a whole is capped at [`MAX_ARRAY_BYTES`]
+//! (every byte from the `[` counts). Elements before a problem are still delivered; an
+//! invalid array or one over the cap then ends with a single fatal error (the rest of the
+//! input is unreadable). Error lines are absolute, even for multi-line elements.
 
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader, ErrorKind, Read};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::Path;
 use zaaf_event::JsonEvent;
 
 /// Maximum accepted length of one NDJSON line; longer lines are reported as
 /// errors and skipped.
 pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
-/// Maximum accepted size of a JSON array input (it is fully buffered).
+/// Maximum accepted size of a JSON array input, counted from its opening `[`.
 pub const MAX_ARRAY_BYTES: usize = 256 * 1024 * 1024;
 
 const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
@@ -27,8 +29,8 @@ pub struct InputError {
     /// 1-based line in the input (0 when unknown).
     pub line: usize,
     pub message: String,
-    /// True for I/O read errors and whole-array failures: the input is unreadable and iteration ends.
-    /// False for malformed records (invalid JSON, oversized line or array),
+    /// True for I/O read errors and array failures (invalid or over the cap): the input is unreadable and iteration ends.
+    /// False for malformed NDJSON records (invalid JSON, oversized line),
     /// which can be skipped.
     pub fatal: bool,
 }
@@ -43,7 +45,7 @@ fn err_once(line: usize, message: String, fatal: bool) -> Box<dyn Iterator<Item 
     })))
 }
 
-/// Reads NDJSON (streaming) or a single top-level JSON array (buffered).
+/// Reads NDJSON or a single top-level JSON array, both streaming.
 pub fn read_json_events<R: BufRead + 'static>(reader: R) -> Box<dyn Iterator<Item = EventResult>> {
     read_with_limits(reader, MAX_LINE_BYTES, MAX_ARRAY_BYTES)
 }
@@ -104,30 +106,7 @@ fn read_with_limits<R: BufRead + 'static>(
     };
     match first {
         None => Box::new(std::iter::empty()),
-        Some(b'[') => {
-            let mut data = Vec::new();
-            let limit = u64::try_from(max_array_bytes).unwrap_or(u64::MAX - 1) + 1;
-            if let Err(e) = reader.by_ref().take(limit).read_to_end(&mut data) {
-                return err_once(0, format!("read error: {e}"), true);
-            }
-            if data.len() > max_array_bytes {
-                return err_once(
-                    0,
-                    format!(
-                        "JSON array input exceeds {max_array_bytes} bytes; use NDJSON for large inputs"
-                    ),
-                    true,
-                );
-            }
-            match serde_json::from_slice::<Vec<Value>>(&data) {
-                Ok(items) => Box::new(items.into_iter().map(|v| Ok(JsonEvent::new(v)))),
-                Err(e) => err_once(
-                    skipped_lines + e.line(),
-                    format!("invalid JSON array: {e}"),
-                    true,
-                ),
-            }
-        }
+        Some(b'[') => Box::new(ArrayItems::new(reader, max_array_bytes, skipped_lines + 1)),
         Some(_) => Box::new(Lines {
             reader,
             max: max_line_bytes,
@@ -135,6 +114,210 @@ fn read_with_limits<R: BufRead + 'static>(
             done: false,
             buf: Vec::new(),
         }),
+    }
+}
+
+/// Where the array reader is in the document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayState {
+    /// Between or inside elements, before the closing `]`.
+    Elements,
+    /// After the closing `]`: only whitespace may follow.
+    Trailing,
+    Done,
+}
+
+/// Streaming reader for a top-level JSON array. A small byte-level splitter finds
+/// each element's end (tracking string, escape and bracket depth), and every element
+/// is parsed on its own with `serde_json::from_slice`, so only one element is held in
+/// memory at a time (never the whole array). Every byte from the opening `[` counts
+/// against `max`.
+struct ArrayItems<R> {
+    reader: R,
+    max: usize,
+    /// Bytes consumed so far, counted from the opening `[`.
+    total: usize,
+    /// 1-based line of the next unread byte.
+    line: usize,
+    /// Bytes of the element being read (no leading whitespace).
+    buf: Vec<u8>,
+    /// Line on which the current element starts.
+    elem_line: usize,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    /// A comma was read and an element must follow it.
+    after_comma: bool,
+    state: ArrayState,
+}
+
+/// What one pass over a chunk produced.
+enum ArrayStep {
+    Item(Value),
+    Cap,
+    Fail(usize, String),
+}
+
+impl<R: BufRead> ArrayItems<R> {
+    /// `reader` is positioned at the opening `[`; `first_line` is that byte's line.
+    fn new(mut reader: R, max: usize, first_line: usize) -> Self {
+        reader.consume(1);
+        Self {
+            reader,
+            max,
+            total: 1,
+            line: first_line,
+            buf: Vec::new(),
+            elem_line: first_line,
+            depth: 0,
+            in_string: false,
+            escaped: false,
+            after_comma: false,
+            state: ArrayState::Elements,
+        }
+    }
+
+    fn fatal(&mut self, line: usize, message: String) -> Option<EventResult> {
+        self.state = ArrayState::Done;
+        Some(Err(InputError {
+            line,
+            message,
+            fatal: true,
+        }))
+    }
+
+    /// Parses the finished element in `buf` and resets the per-element state.
+    fn finish_element(&mut self) -> ArrayStep {
+        let parsed = serde_json::from_slice::<Value>(&self.buf);
+        if self.buf.capacity() > 1 << 20 {
+            self.buf = Vec::new();
+        } else {
+            self.buf.clear();
+        }
+        match parsed {
+            Ok(v) => ArrayStep::Item(v),
+            Err(e) => {
+                // serde's position is relative to this element; ours is absolute.
+                let text = e.to_string();
+                let text = text
+                    .rsplit_once(" at line ")
+                    .map_or(text.as_str(), |(m, _)| m);
+                ArrayStep::Fail(self.elem_line + e.line() - 1, text.to_string())
+            }
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for ArrayItems<R> {
+    type Item = EventResult;
+
+    fn next(&mut self) -> Option<EventResult> {
+        loop {
+            if self.state == ArrayState::Done {
+                return None;
+            }
+            let chunk = match self.reader.fill_buf() {
+                Ok(c) => c,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    let line = self.line;
+                    return self.fatal(line, format!("read error: {e}"));
+                }
+            };
+            if chunk.is_empty() {
+                if self.state == ArrayState::Trailing {
+                    self.state = ArrayState::Done;
+                    return None;
+                }
+                let line = self.line;
+                return self.fatal(
+                    line,
+                    "invalid JSON array: unexpected end of input".to_string(),
+                );
+            }
+            let mut used = 0;
+            let mut step = None;
+            for &b in chunk {
+                used += 1;
+                self.total += 1;
+                if self.total > self.max {
+                    step = Some(ArrayStep::Cap);
+                    break;
+                }
+                let newline = b == b'\n';
+                if self.state == ArrayState::Trailing {
+                    if !b.is_ascii_whitespace() {
+                        step = Some(ArrayStep::Fail(
+                            self.line,
+                            "trailing characters after the array".to_string(),
+                        ));
+                        break;
+                    }
+                } else if self.in_string {
+                    self.buf.push(b);
+                    if self.escaped {
+                        self.escaped = false;
+                    } else if b == b'\\' {
+                        self.escaped = true;
+                    } else if b == b'"' {
+                        self.in_string = false;
+                    }
+                } else if self.buf.is_empty() && b.is_ascii_whitespace() {
+                    // Whitespace before an element.
+                } else if self.depth == 0 && (b == b',' || b == b']') {
+                    if self.buf.is_empty() {
+                        if b == b']' && !self.after_comma {
+                            self.state = ArrayState::Trailing;
+                        } else {
+                            step = Some(ArrayStep::Fail(self.line, "expected a value".to_string()));
+                            break;
+                        }
+                    } else {
+                        let closes = b == b']';
+                        let r = self.finish_element();
+                        if closes && matches!(r, ArrayStep::Item(_)) {
+                            self.state = ArrayState::Trailing;
+                        }
+                        self.after_comma = !closes;
+                        step = Some(r);
+                        if newline {
+                            self.line += 1;
+                        }
+                        break;
+                    }
+                } else {
+                    if self.buf.is_empty() {
+                        self.elem_line = self.line;
+                    }
+                    match b {
+                        b'"' => self.in_string = true,
+                        b'{' | b'[' => self.depth += 1,
+                        b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+                        _ => {}
+                    }
+                    self.buf.push(b);
+                }
+                if newline {
+                    self.line += 1;
+                }
+            }
+            self.reader.consume(used);
+            match step {
+                Some(ArrayStep::Item(v)) => return Some(Ok(JsonEvent::new(v))),
+                Some(ArrayStep::Cap) => {
+                    let line = self.line;
+                    let message = format!(
+                        "JSON array input exceeds {} bytes; use NDJSON for large inputs",
+                        self.max
+                    );
+                    return self.fatal(line, message);
+                }
+                Some(ArrayStep::Fail(line, m)) => {
+                    return self.fatal(line, format!("invalid JSON array: {m}"));
+                }
+                None => {}
+            }
+        }
     }
 }
 
@@ -282,10 +465,90 @@ mod tests {
     }
 
     #[test]
-    fn broken_json_array_is_one_error() {
+    fn broken_json_array_ends_with_one_fatal_error() {
+        // Elements are streamed, so those before the break are still delivered.
         let items = read("[ {\"a\": 1}, ");
-        assert_eq!(items.len(), 1);
-        assert!(items[0].is_err());
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        assert!(items[1].as_ref().unwrap_err().fatal);
+    }
+
+    #[test]
+    fn array_elements_are_streamed_not_buffered() {
+        // The trap panics when read past its data: the first element must come out
+        // before anything after its separating comma is requested.
+        let trap = Trap {
+            data: b"[{\"a\": 1},".to_vec(),
+            pos: 0,
+            panic_after: true,
+        };
+        let mut it = read_json_events(trap);
+        assert!(it.next().unwrap().is_ok());
+    }
+
+    #[test]
+    fn array_edge_shapes() {
+        let ok = |s: &str| read(s).iter().filter(|r| r.is_ok()).count();
+        assert_eq!(ok("[]"), 0);
+        assert_eq!(ok("[ ]  \n"), 0);
+        assert_eq!(ok(r#"[1, "a]", [2, 3], {"k": "\"],"}, null]"#), 5);
+        assert_eq!(ok("[{\"a\":1},{\"a\":2}]\n\n"), 2);
+        for bad in [
+            "[,]",
+            "[1,]",
+            "[1 2]",
+            "[1] x",
+            "[{\"a\": 1]",
+            "[\"abc",
+            "[{]",
+        ] {
+            let items = read(bad);
+            let err = items.last().unwrap().as_ref().unwrap_err();
+            assert!(err.fatal, "{bad}");
+            assert!(
+                err.message.starts_with("invalid JSON array"),
+                "{bad}: {}",
+                err.message
+            );
+            assert_eq!(items.iter().filter(|r| r.is_err()).count(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn array_error_line_counts_multiline_elements() {
+        let items = read("\n[\n{\n\"a\": 1\n},\n{\n\"b\":\n}\n]");
+        assert!(items[0].is_ok());
+        // The second element spans lines 6 to 8; serde reports its end.
+        assert_eq!(items[1].as_ref().unwrap_err().line, 8);
+        let items = read("[1,\n2,\n3 4]");
+        assert_eq!(items.last().unwrap().as_ref().unwrap_err().line, 3);
+        let items = read("[1,\n2,\n");
+        assert_eq!(items.last().unwrap().as_ref().unwrap_err().line, 3);
+    }
+
+    #[test]
+    fn array_cap_counts_all_bytes_and_keeps_earlier_elements() {
+        // The first element ends before the cap; the cap trips inside the second.
+        let items = read_lim(b"[{\"a\": 1}, {\"a\": 2}, {\"a\": 3}]", 1024, 16);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        let e = items[1].as_ref().unwrap_err();
+        assert!(e.fatal);
+        assert_eq!(
+            e.message,
+            "JSON array input exceeds 16 bytes; use NDJSON for large inputs"
+        );
+        // Exactly at the cap is accepted; one byte over is not.
+        let exact = b"[{\"a\": 1}]";
+        assert!(read_lim(exact, 1024, exact.len()).iter().all(Result::is_ok));
+        assert!(
+            read_lim(exact, 1024, exact.len() - 1)
+                .last()
+                .unwrap()
+                .is_err()
+        );
+        // Trailing whitespace after `]` counts too.
+        assert!(read_lim(b"[1]    ", 1024, 5).last().unwrap().is_err());
     }
 
     #[test]
@@ -366,8 +629,9 @@ mod tests {
     #[test]
     fn array_error_reports_true_line_after_blank_lines() {
         let items = read("\n\n[\n{\"a\": 1},\n{\"a\": }\n]");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].as_ref().unwrap_err().line, 5);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        assert_eq!(items[1].as_ref().unwrap_err().line, 5);
     }
 
     #[test]
@@ -378,16 +642,6 @@ mod tests {
         let items = read_lim(b"\xEF\xBB\xBF[{\"a\": 1}, {\"a\": 2}]", 1024, 1024);
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(Result::is_ok));
-    }
-
-    #[test]
-    fn array_over_cap_is_one_error() {
-        let items = read_lim(b"[{\"a\": 1}, {\"a\": 2}, {\"a\": 3}]", 1024, 16);
-        assert_eq!(items.len(), 1);
-        assert_eq!(
-            items[0].as_ref().unwrap_err().message,
-            "JSON array input exceeds 16 bytes; use NDJSON for large inputs"
-        );
     }
 
     /// Serves `data`, then panics (or errors forever) when read further.
@@ -461,7 +715,7 @@ mod tests {
     #[test]
     fn whole_array_failures_are_fatal() {
         let items = read("[ {\"a\": 1}, ");
-        assert!(items[0].as_ref().unwrap_err().fatal);
+        assert!(items.last().unwrap().as_ref().unwrap_err().fatal);
         let items = read_lim(b"[{\"a\": 1}, {\"a\": 2}]", 1024, 4);
         assert!(items[0].as_ref().unwrap_err().fatal);
     }

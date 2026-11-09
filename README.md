@@ -190,10 +190,11 @@ A broken output pipe (for example `zaaf hunt ... | head`) exits 0.
 <summary><b>Input</b></summary>
 
 `zaaf hunt` reads NDJSON, a JSON array, or stdin. NDJSON lines over 8 MiB (change it with
-`--max-line-bytes <N>`) and JSON arrays
-over 256 MiB are reported as input errors. An oversized NDJSON line counts as a malformed
-record, so it exits 3 only with `--strict` or above `--max-errors`. JSON arrays are buffered in memory in full, so
-prefer NDJSON for large inputs.
+`--max-line-bytes <N>`) are reported as malformed records, so they exit 3 only with `--strict` or
+above `--max-errors`. A JSON array is streamed one element at a time, so memory use does not grow
+with the file; only the largest single element is held. The array as a whole is capped at 256 MiB.
+An invalid array, or one over the cap, makes the input unreadable (exit 3): events before the
+problem have already been processed, and the rest of that input is skipped.
 
 `--from` and `--to` take RFC 3339 timestamps only (for example `2026-11-07T01:00:00Z`); anything
 else, such as a bare year, is a usage error. Events without a detectable timestamp pass the
